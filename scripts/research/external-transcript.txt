@@ -1,0 +1,52 @@
+AX trusted=1 connection=1704815 target pid=29822
+TuckTestAlpha wid=6854 bounds={
+    Height = 24;
+    Width = 44;
+    X = 1884;
+    Y = "-1440";
+}
+TuckTestBeta wid=6856 bounds={
+    Height = 24;
+    Width = 44;
+    X = 1928;
+    Y = "-1440";
+}
+COMMIT direction=0 (no status contract)
+TuckTestAlpha wid=6854 bounds={
+    Height = 24;
+    Width = 44;
+    X = 1884;
+    Y = "-1440";
+}
+TuckTestBeta wid=6856 bounds={
+    Height = 24;
+    Width = 44;
+    X = 1928;
+    Y = "-1440";
+}
+COMMIT direction=1 (no status contract)
+TuckTestAlpha wid=6854 bounds={
+    Height = 24;
+    Width = 44;
+    X = 1884;
+    Y = "-1440";
+}
+TuckTestBeta wid=6856 bounds={
+    Height = 24;
+    Width = 44;
+    X = 1928;
+    Y = "-1440";
+}
+RESET submitted
+TuckTestAlpha wid=6854 bounds={
+    Height = 24;
+    Width = 44;
+    X = 1884;
+    Y = "-1440";
+}
+TuckTestBeta wid=6856 bounds={
+    Height = 24;
+    Width = 44;
+    X = 1928;
+    Y = "-1440";
+}

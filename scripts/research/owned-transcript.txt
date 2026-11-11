@@ -1,0 +1,6 @@
+BEFORE
+A pos 1018 native 1018 frame (1118.0, 2533.0, 44.0, 24.0)
+B pos 974 native 974 frame (1162.0, 2533.0, 44.0, 24.0)
+AFTER
+A pos 934 native 934 frame (1200.0, 2533.0, 44.0, 24.0)
+B pos 974 native 974 frame (1118.0, 2533.0, 44.0, 24.0)
