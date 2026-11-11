@@ -106,12 +106,9 @@ final class AXRead {
 
 /// Captured on main. The incarnation tells one process from a later one that
 /// reuses its PID; without one, nothing remembered about the PID is reused.
-struct AXApplicationContext: Sendable {
-    let pid: pid_t
-    let bundle: String
-    let name: String
-    let incarnation: String
+typealias AXApplicationContext = AppProcess
 
+extension AppProcess {
     /// Launch Services gives agents such as Control Centre no launch date. The
     /// kernel's start time identifies the same process instance just as well.
     static func incarnation(pid: pid_t, launchDate: Date?) -> String {

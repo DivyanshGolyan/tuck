@@ -1,6 +1,27 @@
-import CoreGraphics
-import Foundation
+import AppKit
 import TuckCore
+
+extension AppProcess {
+    /// Running apps with a bundle id, excluding Tuck.
+    @MainActor static func running() -> [AppProcess] {
+        NSWorkspace.shared.runningApplications.compactMap { app in
+            guard app.processIdentifier != getpid(), let bundle = app.bundleIdentifier, bundle != "local.tuck" else { return nil }
+            return AppProcess(pid: app.processIdentifier, bundle: bundle, name: app.localizedName ?? bundle,
+                              incarnation: incarnation(pid: app.processIdentifier, launchDate: app.launchDate))
+        }
+    }
+}
+
+extension Display {
+    /// Attached displays in CoreGraphics global coordinates; `usableLeft` as Mover computes it.
+    @MainActor static func current() -> [Display] {
+        NSScreen.screens.compactMap { screen in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+            let frame = CGDisplayBounds(number.uint32Value)
+            return Display(frame: frame, usableLeft: screen.auxiliaryTopRightArea?.minX ?? frame.minX + 180)
+        }
+    }
+}
 
 // MARK: - The single window-list parser
 

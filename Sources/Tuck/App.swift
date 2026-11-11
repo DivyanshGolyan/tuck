@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var separator: NSStatusItem!
     private var ownFrames: [String: BarIcon] = [:]
     private var observationY: CGFloat?
-    private var verifiedLayout: VerifiedVisibilityLayout?
+    private var bar = MenuBar.none
     private var fastHides = 0
     private var fastHideReason: String?
     private var lastScanMS: Double = 0
@@ -208,7 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 var previousPlacement = config
                 previousPlacement?.showHidden = loaded.config.showHidden
                 let visibilityOnly = previousPlacement == loaded.config
-                if !visibilityOnly { verifiedLayout = nil }
+                if !visibilityOnly { bar = .none }
                 config = loaded.config
                 desiredRevision += 1
                 backoff.reset()
@@ -231,22 +231,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// A visibility-only edit doesn't require rediscovering every AX provider.
-    /// Check fresh window membership and order against a fully verified layout;
-    /// a new/missing/reordered window falls back to normal reconciliation.
+    /// One window-list read: if the carried bar still vouches for every app and the
+    /// managed order is the one the last full pass verified, hide; otherwise the
+    /// normal pass does the work.
     private func hideVerifiedLayout(request: Int) async {
-        guard let verifiedLayout else { fastHideReason = "no verified layout"; return }
+        guard bar.reusable else { fastHideReason = "no verified layout"; return }
         guard !history.pending else { fastHideReason = "move outcome unknown"; return }
         guard accessibility else { fastHideReason = "permission not verified"; return }
         guard !observers.isMenuOpen, !mover.userIsBusy else { fastHideReason = "input or menu before check"; return }
         let generation = gate.generation
         let started = DispatchTime.now().uptimeNanoseconds
-        guard let fresh = try? await geometry.run({ try WindowLayoutSnapshot.read() }) else { fastHideReason = "window read failed"; return }
+        guard let read = try? await geometry.run({ try WindowList.readSkippingMalformed() }) else { fastHideReason = "window read failed"; return }
         lastVisibilityCheckMS = elapsedMS(since: started)
         guard request == configRequest else { fastHideReason = "config changed during check"; return }
         guard generation == gate.generation else { fastHideReason = "work generation changed during check"; return }
         guard !terminating, !showHidden, !Mover.sessionIsLocked else { fastHideReason = "intent, lock or termination changed"; return }
         guard !history.pending, !observers.isMenuOpen, !mover.userIsBusy else { fastHideReason = "input, menu or move during check"; return }
-        if let reason = verifiedLayout.mismatchReason(fresh) { fastHideReason = reason; return }
+        let rows = MenuRows(read.list, ownPID: getpid(), displays: Display.current(), skippedMalformed: read.malformed)
+        guard !rows.skippedMalformed else { fastHideReason = "invalid window snapshot"; return }
+        let running = AppProcess.running()
+        let observed = MenuBar.observe(rows, running: running, readings: [], previous: bar)
+        guard observed.complete else {
+            let stale = bar.staleApps(in: rows, running: running)
+            let first = stale.keys.min().map { pid in "\(running.first { $0.pid == pid }?.name ?? String(pid)): \(stale[pid]!)" }
+            fastHideReason = rows.fault ?? first ?? observed.issues.first?.message ?? "incomplete observation"
+            return
+        }
+        // The bar vouches for identities, not order; the hide rule below is only
+        // safe for the order the last full pass verified.
+        guard observed.order == bar.order else { fastHideReason = "known window order changed"; return }
         guard let config else { fastHideReason = "config missing"; return }
         let available = Set(snapshot.icons.filter(\.movable).map(\.id))
         separator.length = config.hidden.contains(where: available.contains) ? 10_000 : 4
@@ -738,17 +751,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if observers.isRefreshing || observers.issues.contains(where: { $0.recovery == .retry }) {
             throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting for observation subscriptions"))
         }
-        let finalIcons = fresh.icons + [Inventory.separatorID, Inventory.controlID].compactMap { ownFrames[$0] }
-        if let beforeKeys, let afterGeometry = try? await geometry.run({ try WindowLayoutSnapshot.read() }) {
+        if let beforeKeys, let read = try? await geometry.run({ try WindowList.readSkippingMalformed() }) {
             try check(token)
-            verifiedLayout = VerifiedVisibilityLayout(before: beforeKeys, after: afterGeometry, icons: finalIcons)
-        } else { verifiedLayout = nil }
+            bar = !read.malformed && read.list.keys == beforeKeys
+                ? Self.verifiedBar(fresh.icons, list: read.list, running: AppProcess.running(), displays: Display.current())
+                : .none
+        } else { bar = .none }
         lap("verify")
         reconciles += 1
         reconcilePhases = phases
         lastReconcileMS = phases.values.reduce(0, +)
         completed = true
         return note
+    }
+
+    /// The scan's icons as clean readings over the list read after the pass applied.
+    /// Every running app with a status window was read by that scan, so one without
+    /// icons is read as having none.
+    private static func verifiedBar(_ icons: [BarIcon], list: WindowList, running: [AppProcess],
+                                    displays: [Display]) -> MenuBar {
+        let byPID = Dictionary(grouping: icons, by: \.pid)
+        let present = Set(list.windows.map(\.key.pid))
+        let readings = running.filter { byPID[$0.pid] != nil || present.contains($0.pid) }.map { app in
+            AppReading(app: app, outcome: .clean((byPID[app.pid] ?? []).enumerated().map { index, icon in
+                AppReading.BoundIcon(identity: IconIdentity(bundle: icon.metadata.bundleID, item: icon.metadata.item),
+                                     label: icon.metadata.label, movable: icon.movable,
+                                     window: WindowKey(pid: icon.pid, number: icon.windowID), element: index)
+            }))
+        }
+        return MenuBar.observe(MenuRows(list, ownPID: getpid(), displays: displays), running: running,
+                               readings: readings, previous: .none)
     }
 
     private func issue(for error: Error) -> WorkIssue {
@@ -788,7 +820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "scanMS": lastScanMS, "configLoadMS": lastConfigLoadMS,
             "visibilityCheckMS": lastVisibilityCheckMS, "fastHides": fastHides,
             "fastHideReason": fastHideReason as Any? ?? NSNull(),
-            "verifiedLayout": verifiedLayout != nil,
+            "verifiedLayout": bar.reusable,
             "icons": snapshot.icons.map { ["id": $0.id, "label": $0.metadata.label, "movable": $0.movable, "x": $0.frame.minX] as [String: Any] },
             "hiddenIDs": config?.hidden ?? [], "revision": desiredRevision,
             "appliedRevision": appliedRevision as Any? ?? NSNull(), "workGeneration": gate.generation,
