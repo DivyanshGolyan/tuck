@@ -544,27 +544,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pid = getpid()
         let row = observationY
         let found: [BarIcon] = try await SerialWorker.system.run {
-            let windows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-            let candidates = windows.compactMap { info -> StatusWindow? in
-                guard (info[kCGWindowOwnerPID as String] as? Int32) == pid,
-                      (info[kCGWindowLayer as String] as? Int) == Int(CGWindowLevelForKey(.statusWindow)),
-                      let bounds = info[kCGWindowBounds as String] as? NSDictionary,
-                      let frame = CGRect(dictionaryRepresentation: bounds),
-                      let windowID = info[kCGWindowNumber as String] as? UInt32 else { return nil }
-                return StatusWindow(id: windowID, frame: frame,
-                    publicTitle: info[kCGWindowName as String] as? String ?? "",
-                    onScreen: info[kCGWindowIsOnscreen as String] as? Bool ?? false)
-            }
-            return [(Inventory.separatorID, "TuckSeparator"), (Inventory.controlID, "TuckControl")].compactMap { id, title in
+            let windows = (try? WindowList.readSkippingMalformed())?.list.windows ?? []
+            let candidates = windows.filter { $0.key.pid == pid }
+            return [OwnItem.separator, .control].compactMap { own in
                 let selected: StatusWindow?
-                if let row { selected = ownedStatusWindow(title: title, menuY: row, candidates: candidates) }
+                if let row { selected = ownedStatusWindow(title: own.title, menuY: row, candidates: candidates) }
                 else {
-                    let named = candidates.filter { $0.publicTitle == title }
+                    let named = candidates.filter { $0.title == own.title }
                     selected = named.count == 1 ? named[0] : nil
                 }
                 return selected.map {
-                    BarIcon(id: id, metadata: ItemMetadata(bundleID: "local.tuck", label: id), pid: pid,
-                            windowID: $0.id, frame: $0.frame, movable: true)
+                    BarIcon(id: own.id, metadata: ItemMetadata(bundleID: "local.tuck", label: own.id), pid: pid,
+                            windowID: $0.key.number, frame: $0.frame, movable: true)
                 }
             }
         }

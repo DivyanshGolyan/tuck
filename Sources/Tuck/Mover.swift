@@ -43,7 +43,7 @@ final class Mover {
         let targetX = anchor.map { $0.frame.minX - 2 } ?? rightEdge
         let targetGap = originalDisplay.frame.maxX - targetX
         return try await SerialWorker.system.run {
-        let windows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let windows = (try? WindowList.readSkippingMalformed())?.list.windows ?? []
         // Prefer the current row. A narrow/notched display can have status windows
         // that exist but cannot receive physical hits. Use a visible mirrored row
         // on another attached display, without changing the configured layout.
@@ -56,10 +56,8 @@ final class Mover {
             let end = CGPoint(x: display.frame.maxX - targetGap, y: display.frame.minY + 12)
             guard end.x >= display.usableLeft, end.x < display.frame.maxX else { continue }
             let matches = windows.compactMap { window -> CGRect? in
-                guard (window[kCGWindowOwnerPID as String] as? Int32) == icon.pid,
-                      (window[kCGWindowLayer as String] as? Int) == Int(CGWindowLevelForKey(.statusWindow)),
-                      let bounds = window[kCGWindowBounds as String] as? NSDictionary,
-                      let frame = CGRect(dictionaryRepresentation: bounds),
+                let frame = window.frame
+                guard window.key.pid == icon.pid,
                       abs(frame.minY - display.frame.minY) < 2,
                       abs(frame.width - icon.frame.width) < 2,
                       abs((display.frame.maxX - frame.maxX) - sourceGap) < 2,

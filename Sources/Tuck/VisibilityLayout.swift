@@ -1,55 +1,22 @@
 import CoreGraphics
 import Foundation
-
-struct WindowKey: Hashable, Sendable {
-    let pid: Int32
-    let id: UInt32
-}
+import TuckCore
 
 /// No AX, display filtering, visibility filtering, or menu-item title heuristics.
 /// The caller chooses a worker; this synchronous read never polls or retries.
 struct WindowLayoutSnapshot: Sendable {
-    struct Window: Sendable {
-        let key: WindowKey
-        let frame: CGRect
-        let onScreen: Bool
-
-        init(key: WindowKey, frame: CGRect, onScreen: Bool = false) {
-            self.key = key; self.frame = frame; self.onScreen = onScreen
-        }
-    }
+    typealias Window = StatusWindow
     let windows: [Window]
     var keys: Set<WindowKey> { Set(windows.map(\.key)) }
 
+    /// Throws `WindowList.Fault`; a malformed status record fails the whole read.
     static func read() throws -> WindowLayoutSnapshot {
-        guard let records = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            throw ReadFailure.unavailable
-        }
-        return try WindowLayoutSnapshot(records: records)
+        WindowLayoutSnapshot(try WindowList.read())
     }
 
     init(windows: [Window]) { self.windows = windows }
 
-    /// Every status-layer window in an already fetched window list.
-    init(records: [[String: Any]]) throws {
-        let layer = Int(CGWindowLevelForKey(.statusWindow))
-        var windows: [Window] = []
-        for record in records where (record[kCGWindowLayer as String] as? Int) == layer {
-            guard let pid = record[kCGWindowOwnerPID as String] as? Int32,
-                  let id = record[kCGWindowNumber as String] as? UInt32,
-                  let bounds = record[kCGWindowBounds as String] as? NSDictionary,
-                  let frame = CGRect(dictionaryRepresentation: bounds), usable(frame) else {
-                throw ReadFailure.malformed
-            }
-            windows.append(Window(key: WindowKey(pid: pid, id: id), frame: frame,
-                onScreen: (record[kCGWindowIsOnscreen as String] as? Bool) ?? false))
-        }
-        self.windows = windows
-    }
-
-    enum ReadFailure: Error {
-        case unavailable, malformed
-    }
+    init(_ list: WindowList) { windows = list.windows }
 }
 
 /// A projection of AX-verified logical roles onto all anchored physical rows.
@@ -75,7 +42,7 @@ struct VerifiedVisibilityLayout: Sendable {
               after.windows.count == after.keys.count,
               after.windows.allSatisfy({ usable($0.frame) }),
               Set(icons.map(\.id)).count == icons.count,
-              Set(icons.map { WindowKey(pid: $0.pid, id: $0.windowID) }).count == icons.count,
+              Set(icons.map { WindowKey(pid: $0.pid, number: $0.windowID) }).count == icons.count,
               icons.allSatisfy({ usable($0.frame) }),
               let first = icons.first,
               icons.allSatisfy({ abs($0.frame.minY - first.frame.minY) < 2 }),
@@ -86,8 +53,8 @@ struct VerifiedVisibilityLayout: Sendable {
         let managed = ordered.filter { $0.movable || $0.id == Inventory.controlID || $0.id == Inventory.separatorID }
         guard strictlyOrdered(managed.map { $0.frame.minX }) else { return nil }
         let windows = Dictionary(uniqueKeysWithValues: after.windows.map { ($0.key, $0) })
-        let controlKey = WindowKey(pid: control.pid, id: control.windowID)
-        let separatorKey = WindowKey(pid: separator.pid, id: separator.windowID)
+        let controlKey = WindowKey(pid: control.pid, number: control.windowID)
+        let separatorKey = WindowKey(pid: separator.pid, number: separator.windowID)
         guard let currentControl = windows[controlKey], let currentSeparator = windows[separatorKey],
               abs(currentControl.frame.width - control.frame.width) < 2,
               abs(currentSeparator.frame.width - currentControl.frame.width) >= 2 else { return nil }
@@ -116,7 +83,7 @@ struct VerifiedVisibilityLayout: Sendable {
         var fixedWindows: [WindowLayoutSnapshot.Window] = []
         var used: Set<WindowKey> = []
         for icon in ordered where !icon.movable && icon.id != Inventory.controlID && icon.id != Inventory.separatorID {
-            let key = WindowKey(pid: icon.pid, id: icon.windowID)
+            let key = WindowKey(pid: icon.pid, number: icon.windowID)
             guard let source = windows[key], let sourceRow = rowIndex(source) else { return nil }
             var candidates = after.windows.filter {
                 $0.key.pid == key.pid && abs($0.frame.width - source.frame.width) < 2 && rowIndex($0) != nil
@@ -152,7 +119,7 @@ struct VerifiedVisibilityLayout: Sendable {
         // Remove only their uniquely identified widths before comparing offsets.
         var projected: [Role] = []
         for icon in ordered {
-            let sourceKey = WindowKey(pid: icon.pid, id: icon.windowID)
+            let sourceKey = WindowKey(pid: icon.pid, number: icon.windowID)
             if let role = fixed[sourceKey] { projected.append(role); continue }
             guard let source = windows[sourceKey], let sourceRow = rowIndex(source),
                   let sourceX = normalizedX(source), let anchorX = normalizedX(anchors[sourceRow]) else { return nil }
@@ -191,7 +158,7 @@ struct VerifiedVisibilityLayout: Sendable {
         // Unknowns never become logical roles, even if they resemble replicas.
         let unknown = after.windows.filter { !used.contains($0.key) }
         allStatusKeys = before
-        knownOrder = ordered.map { WindowKey(pid: $0.pid, id: $0.windowID) }
+        knownOrder = ordered.map { WindowKey(pid: $0.pid, number: $0.windowID) }
         row = first.frame.minY
         rows = physicalRows
         ownPID = control.pid
@@ -244,7 +211,7 @@ struct VerifiedVisibilityLayout: Sendable {
             guard previous.onScreen == window.onScreen else { return "untracked visibility changed" }
             guard previous.frame.minY == window.frame.minY else { return "untracked row changed" }
             if rowIndex(previous) != nil {
-                guard previous.frame == window.frame else { return "untracked geometry changed: pid=\(key.pid) window=\(key.id) \(previous.frame) -> \(window.frame)" }
+                guard previous.frame == window.frame else { return "untracked geometry changed: pid=\(key.pid) window=\(key.number) \(previous.frame) -> \(window.frame)" }
                 if window.onScreen && (16...64).contains(window.frame.height) {
                     return "untracked active menu-bar window"
                 }

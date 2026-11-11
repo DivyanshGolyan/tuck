@@ -27,8 +27,8 @@ struct InventorySnapshot: Sendable {
 
 @MainActor
 final class Inventory {
-    nonisolated static let separatorID = "__tuck_separator__"
-    nonisolated static let controlID = "__tuck_control__"
+    nonisolated static let separatorID = OwnItem.separator.id
+    nonisolated static let controlID = OwnItem.control.id
     private let reader = InventoryReader()
 
     func scan() async throws -> InventorySnapshot {
@@ -44,14 +44,10 @@ final class Inventory {
     }
 
     nonisolated static func key(bundle: String, item: String?) -> String {
-        guard let item else { return bundle }
-        return bundle + "::" + item
+        IconIdentity(bundle: bundle, item: item).key
     }
     nonisolated static func isMovable(bundle: String, item: String) -> Bool {
-        if bundle == "com.apple.controlcenter" {
-            return !["Clock", "BentoBox", "AudioVideoModule", "com.apple.menuextra.clock", "com.apple.menuextra.controlcenter", "com.apple.menuextra.audiovideo"].contains(item)
-        }
-        return bundle != "com.apple.notificationcenterui"
+        IconIdentity.isMovable(bundle: bundle, item: item)
     }
 }
 
@@ -64,33 +60,6 @@ extension NSScreen {
     }
 }
 
-struct StatusWindow: Hashable {
-    let id: CGWindowID
-    let frame: CGRect
-    let publicTitle: String
-    let onScreen: Bool
-}
-
-/// Candidates MUST already be restricted to this process's status-layer windows.
-/// A unique named source establishes the role; only its width and the requested
-/// physical row may select an unnamed replica. Offscreen separators are valid.
-func ownedStatusWindow(title: String, menuY: CGFloat, candidates: [StatusWindow]) -> StatusWindow? {
-    let sources = candidates.filter { $0.publicTitle == title }
-    guard sources.count == 1, let source = sources.first else { return nil }
-    if abs(source.frame.minY - menuY) < 2 { return source }
-    let replicas = candidates.filter {
-        abs($0.frame.minY - menuY) < 2 && abs($0.frame.width - source.frame.width) < 2
-    }
-    return replicas.count == 1 ? replicas.first : nil
-}
-
-/// Successful empty AX extras plus only never-observed offscreen CG windows is
-/// not evidence of an accessible icon. Retain known hidden icons on AX loss,
-/// but allow actual removal when no status windows remain.
-func shouldBlockEmptyExtras(candidates: [StatusWindow], hasLastGood: Bool) -> Bool {
-    !candidates.isEmpty && (hasLastGood || candidates.contains(where: \.onScreen))
-}
-
 private struct AXStatusItem {
     let element: AXUIElement
     var frame: CGRect
@@ -98,21 +67,6 @@ private struct AXStatusItem {
     let compatibility: String?
     let cached: String?
     let description: String?
-}
-
-/// Strict evidence tiers, not a nearest-window heuristic. Status windows can
-/// overlap even in a single current CG snapshot (for example a dormant FocusModes
-/// replica over Battery). A midpoint alone does not identify the owning window.
-func matchWindow(_ frame: CGRect, candidates: [StatusWindow], used: Set<CGWindowID>) -> StatusWindow? {
-    let exact = candidates.filter {
-        abs($0.frame.minX - frame.minX) < 2 && abs($0.frame.minY - frame.minY) < 2 &&
-        abs($0.frame.width - frame.width) < 2 && abs($0.frame.height - frame.height) < 2
-    }
-    if !exact.isEmpty { return exact.count == 1 && !used.contains(exact[0].id) ? exact[0] : nil }
-    // AX can report a content inset rather than the entire status window. Require
-    // containment of the WHOLE AX rect, and a unique candidate, not just its center.
-    let containing = candidates.filter { $0.frame.insetBy(dx: -2, dy: -2).contains(frame) }
-    return containing.count == 1 && !used.contains(containing[0].id) ? containing[0] : nil
 }
 
 /// All mutable state and AX references are confined to SerialWorker.system.
@@ -127,27 +81,21 @@ private final class InventoryReader {
     // too, so its AX geometry is not asked for again.
     private var lastGoodEvidence: [pid_t: Set<StatusWindow>] = [:]
 
-    private func windowInfo() throws -> [[String: Any]] {
-        guard let windows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            throw AXReadFailure("Window inventory temporarily unavailable")
-        }
-        return windows
+    /// Malformed records are skipped here, as they always were; `malformed` says
+    /// whether any were.
+    private func windowInfo() throws -> (list: WindowList, malformed: Bool) {
+        do { return try WindowList.readSkippingMalformed() }
+        catch { throw AXReadFailure("Window inventory temporarily unavailable") }
     }
 
-    private func statusWindows(_ windows: [[String: Any]], displays: [CGRect], pid: pid_t? = nil) -> [pid_t: [StatusWindow]] {
+    private func statusWindows(_ windows: [StatusWindow], displays: [CGRect], pid: pid_t? = nil) -> [pid_t: [StatusWindow]] {
         var result: [pid_t: [StatusWindow]] = [:]
         for window in windows {
-            guard (window[kCGWindowLayer as String] as? Int) == Int(CGWindowLevelForKey(.statusWindow)),
-                  let owner = window[kCGWindowOwnerPID as String] as? Int32,
-                  pid == nil || owner == pid,
-                  let id = window[kCGWindowNumber as String] as? UInt32,
-                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
-                  let frame = CGRect(dictionaryRepresentation: bounds),
+            let frame = window.frame
+            guard pid == nil || window.key.pid == pid,
                   frame.height >= 16, frame.height <= 64, frame.width > 0,
                   displays.contains(where: { abs(frame.minY - $0.minY) < 2 }) else { continue }
-            result[owner, default: []].append(StatusWindow(id: id, frame: frame,
-                publicTitle: window[kCGWindowName as String] as? String ?? "",
-                onScreen: window[kCGWindowIsOnscreen as String] as? Bool ?? false))
+            result[window.key.pid, default: []].append(window)
         }
         return result
     }
@@ -156,15 +104,11 @@ private final class InventoryReader {
     /// system. A window that vanished or was never seen falls back to the full
     /// list; a window created since is caught by the caller's re-sample.
     private func freshStatusWindows(known: [StatusWindow], displays: [CGRect], pid: pid_t) throws -> [StatusWindow] {
-        if !known.isEmpty {
-            var ids = known.map { UnsafeRawPointer(bitPattern: UInt($0.id)) }
-            if let array = CFArrayCreate(kCFAllocatorDefault, &ids, ids.count, nil),
-               let described = CGWindowListCreateDescriptionFromArray(array) as? [[String: Any]],
-               described.count == known.count {
-                return statusWindows(described, displays: displays, pid: pid)[pid] ?? []
-            }
+        if !known.isEmpty, let described = try? WindowList.describe(known.map(\.key)),
+           described.count == known.count {
+            return statusWindows(described, displays: displays, pid: pid)[pid] ?? []
         }
-        return statusWindows(try windowInfo(), displays: displays, pid: pid)[pid] ?? []
+        return statusWindows(try windowInfo().list.windows, displays: displays, pid: pid)[pid] ?? []
     }
 
     func scan(displays: [CGRect], apps: [AXApplicationContext]) -> InventorySnapshot {
@@ -182,8 +126,8 @@ private final class InventoryReader {
         let statusKeys: Set<WindowKey>?
         do {
             let info = try windowInfo()
-            initial = statusWindows(info, displays: displays)
-            statusKeys = (try? WindowLayoutSnapshot(records: info))?.keys
+            initial = statusWindows(info.list.windows, displays: displays)
+            statusKeys = info.malformed ? nil : info.list.keys
         } catch {
             return InventorySnapshot(icons: lastGood.values.flatMap { $0 }, ambiguous: [],
                 issues: [WorkIssue(recovery: .retry, message: error.localizedDescription)])
@@ -244,10 +188,10 @@ private final class InventoryReader {
                 }
                 var candidates = try freshStatusWindows(known: initial[pid] ?? [], displays: displays, pid: pid)
                 func allMatch() -> Bool {
-                    var used = Set<CGWindowID>()
+                    var used = Set<WindowKey>()
                     for record in records {
                         guard let window = matchWindow(record.frame, candidates: candidates, used: used) else { return false }
-                        used.insert(window.id)
+                        used.insert(window.key)
                     }
                     return true
                 }
@@ -258,11 +202,11 @@ private final class InventoryReader {
                         guard let frame = try read.frame(records[index].element) else { throw AXReadFailure("Status geometry changed during read") }
                         records[index].frame = frame
                     }
-                    candidates = statusWindows(try windowInfo(), displays: displays, pid: pid)[pid] ?? []
+                    candidates = statusWindows(try windowInfo().list.windows, displays: displays, pid: pid)[pid] ?? []
                 }
                 // Titles enrich a uniquely matched window; they never select it.
                 let named = candidates.map { window in
-                    (window: window, title: window.publicTitle.isEmpty ? (titles.title(windowID: window.id) ?? "") : window.publicTitle)
+                    (window: window, title: window.title.isEmpty ? (titles.title(windowID: window.key.number) ?? "") : window.title)
                 }
                 let meaningful = named.filter { !$0.title.isEmpty }
                 let distinctNames = Set(meaningful.map(\.title))
@@ -272,22 +216,22 @@ private final class InventoryReader {
                     return display.maxX - frame.maxX
                 }
                 func titleForWindow(_ window: StatusWindow) -> String? {
-                    if let title = named.first(where: { $0.window.id == window.id })?.title.nilIfEmpty { return title }
+                    if let title = named.first(where: { $0.window.key == window.key })?.title.nilIfEmpty { return title }
                     guard let gap = rightGap(window.frame) else { return nil }
                     let peers = Set(meaningful.filter {
                         abs($0.window.frame.width - window.frame.width) < 2 && rightGap($0.window.frame).map { abs($0 - gap) < 2 } == true
                     }.map(\.title))
                     return peers.count == 1 ? peers.first : nil
                 }
-                var used = Set<CGWindowID>()
+                var used = Set<WindowKey>()
                 for record in records {
                     let window = matchWindow(record.frame, candidates: candidates, used: used)
                     if debug && (window == nil || bundle == "com.apple.controlcenter") {
-                        let geometry = candidates.map { "\($0.id):\($0.frame):onscreen=\($0.onScreen)" }.joined(separator: "; ")
-                        fputs("AX inventory \(bundle) id=\(record.identifier ?? record.cached ?? "?") AX=\(record.frame) matched=\(window?.id.description ?? "none") CG=[\(geometry)]\n", stderr)
+                        let geometry = candidates.map { "\($0.key.number):\($0.frame):onscreen=\($0.onScreen)" }.joined(separator: "; ")
+                        fputs("AX inventory \(bundle) id=\(record.identifier ?? record.cached ?? "?") AX=\(record.frame) matched=\(window?.key.number.description ?? "none") CG=[\(geometry)]\n", stderr)
                     }
                     guard let window else { ambiguous.append("\(name): ambiguous window match"); continue }
-                    used.insert(window.id)
+                    used.insert(window.key)
                     let item = record.identifier ?? (distinctNames.count > 1 ? titleForWindow(window) : nil) ?? record.compatibility ?? record.cached
                     if let item {
                         knownElements[pid, default: []].removeAll { CFEqual($0.0, record.element) }
@@ -298,11 +242,11 @@ private final class InventoryReader {
                         ambiguous.append(message); issues.append(WorkIssue(recovery: .awaitChange, message: message)); continue
                     }
                     let label = elements.count > 1 ? "\(name) — \(bundle == "com.apple.controlcenter" ? (record.description ?? item ?? "icon") : (item ?? "icon"))" : name
-                    let windowTitle = named.first(where: { $0.window.id == window.id })?.title ?? ""
+                    let windowTitle = named.first(where: { $0.window.key == window.key })?.title ?? ""
                     let movable = Inventory.isMovable(bundle: bundle, item: item ?? windowTitle)
                     icons.append(BarIcon(id: Inventory.key(bundle: bundle, item: item),
                         metadata: ItemMetadata(bundleID: bundle, label: label, item: item, movable: movable),
-                        pid: pid, windowID: window.id, frame: window.frame, movable: movable))
+                        pid: pid, windowID: window.key.number, frame: window.frame, movable: movable))
                 }
                 if elements.isEmpty && shouldBlockEmptyExtras(candidates: candidates, hasLastGood: !(lastGood[pid] ?? []).isEmpty) {
                     ambiguous.append("\(name): accessibility inventory unavailable")

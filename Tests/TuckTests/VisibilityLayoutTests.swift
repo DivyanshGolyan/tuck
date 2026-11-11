@@ -7,18 +7,18 @@ final class VisibilityLayoutTests: XCTestCase {
     private typealias Window = WindowLayoutSnapshot.Window
     private func window(_ id: UInt32, x: CGFloat, y: CGFloat = 0, width: CGFloat = 36,
                         height: CGFloat = 24, pid: Int32 = 42, onScreen: Bool = false) -> Window {
-        .init(key: WindowKey(pid: pid, id: id), frame: CGRect(x: x, y: y, width: width, height: height), onScreen: onScreen)
+        .init(key: WindowKey(pid: pid, number: id), frame: CGRect(x: x, y: y, width: width, height: height), onScreen: onScreen)
     }
     private func snapshot(_ windows: [Window]) -> WindowLayoutSnapshot { .init(windows: windows) }
     private func icon(_ window: Window, movable: Bool = true) -> BarIcon {
         let id: String
-        switch window.key.id {
+        switch window.key.number {
         case 10: id = Inventory.separatorID
         case 11: id = Inventory.controlID
-        default: id = String(window.key.id)
+        default: id = String(window.key.number)
         }
         return BarIcon(id: id, metadata: ItemMetadata(bundleID: "test", label: id), pid: window.key.pid,
-                       windowID: window.key.id, frame: window.frame, movable: movable)
+                       windowID: window.key.number, frame: window.frame, movable: movable)
     }
     private func icons(_ windows: [Window]) -> [BarIcon] { windows.map { icon($0) } }
     // CPU and Battery deliberately share PID AND width. Their own-control-relative
@@ -29,7 +29,7 @@ final class VisibilityLayoutTests: XCTestCase {
          window(11, x: 280, width: 32, pid: 900, onScreen: true)]
     }
     private func replicas(_ sources: [Window]) -> [Window] {
-        sources.map { window($0.key.id + 100, x: $0.frame.minX - 414, y: -1440,
+        sources.map { window($0.key.number + 100, x: $0.frame.minX - 414, y: -1440,
                             width: $0.frame.width, height: $0.frame.height, pid: $0.key.pid) }
     }
     private var projected: [Window] { known + replicas(known) }
@@ -38,8 +38,8 @@ final class VisibilityLayoutTests: XCTestCase {
     }
     private func exchangeRows(_ windows: [Window]) -> [Window] {
         windows.map { source in
-            let otherID = source.key.id < 100 ? source.key.id + 100 : source.key.id - 100
-            guard let other = windows.first(where: { $0.key == WindowKey(pid: source.key.pid, id: otherID) }) else { return source }
+            let otherID = source.key.number < 100 ? source.key.number + 100 : source.key.number - 100
+            guard let other = windows.first(where: { $0.key == WindowKey(pid: source.key.pid, number: otherID) }) else { return source }
             return .init(key: source.key, frame: other.frame, onScreen: other.onScreen)
         }
     }
@@ -67,13 +67,13 @@ final class VisibilityLayoutTests: XCTestCase {
     func testKnownOwnedSeparatorReplicaMayBecomeOnscreenAndChangeWidth() throws {
         let cert = try certificate(projected)
         let changed = projected.map { item -> Window in
-            guard item.key == WindowKey(pid: 900, id: 110) else { return item }
+            guard item.key == WindowKey(pid: 900, number: 110) else { return item }
             return window(110, x: item.frame.minX - 5000, y: -1440, width: 10_000, pid: 900, onScreen: true)
         }
         // Keep separator after the hidden roles and before control on its row.
         let reordered = changed.map { item -> Window in
             guard item.key.pid == 42 && item.frame.minY == -1440 else { return item }
-            return window(item.key.id, x: item.frame.minX - 6000, y: -1440, pid: 42)
+            return window(item.key.number, x: item.frame.minX - 6000, y: -1440, pid: 42)
         }
         XCTAssertTrue(cert.matches(snapshot(reordered)), cert.mismatchReason(snapshot(reordered)) ?? "")
     }
@@ -81,8 +81,8 @@ final class VisibilityLayoutTests: XCTestCase {
     func testFreshCGSeparatorGeometryNotStaleAXWidthSelectsReplicas() throws {
         let hidden = projected.map { item -> Window in
             let shift: CGFloat = item.key.pid == 42 ? -10_000 : 0
-            let width: CGFloat = [10, 110].contains(item.key.id) ? 10_000 : item.frame.width
-            return window(item.key.id, x: item.frame.minX + shift, y: item.frame.minY,
+            let width: CGFloat = [10, 110].contains(item.key.number) ? 10_000 : item.frame.width
+            return window(item.key.number, x: item.frame.minX + shift, y: item.frame.minY,
                           width: width, pid: item.key.pid, onScreen: item.onScreen)
         }
         let cert = try certificate(hidden, evidence: icons(known))
@@ -96,7 +96,7 @@ final class VisibilityLayoutTests: XCTestCase {
         // Swap CPU/Battery on just the replica row, retaining all identities.
         let changed = projected.map { item -> Window in
             guard item.key.pid == 42 && item.frame.minY == -1440 else { return item }
-            return window(item.key.id, x: item.key.id == 101 ? -234 : -314, y: -1440)
+            return window(item.key.number, x: item.key.number == 101 ? -234 : -314, y: -1440)
         }
         XCTAssertFalse(cert.matches(snapshot(changed)))
         // Replica IDs have no prior identity at certificate creation: geometry
@@ -115,7 +115,7 @@ final class VisibilityLayoutTests: XCTestCase {
     }
 
     func testMissingManagedReplicaCannotBeCertified() {
-        let missing = projected.filter { $0.key.id != 101 }
+        let missing = projected.filter { $0.key.number != 101 }
         XCTAssertNil(VerifiedVisibilityLayout(before: snapshot(missing).keys, after: snapshot(missing), icons: icons(known)))
     }
 
@@ -136,7 +136,7 @@ final class VisibilityLayoutTests: XCTestCase {
         let cert = try certificate(original, evidence: icons(known) + [icon(clock, movable: false)])
         let changed = exchangeRows(original).map { item -> Window in
             guard item.key.pid == 55 else { return item }
-            return window(item.key.id, x: -9000, y: item.frame.minY, width: 30, pid: 55)
+            return window(item.key.number, x: -9000, y: item.frame.minY, width: 30, pid: 55)
         }
         XCTAssertTrue(cert.matches(snapshot(changed)))
     }
@@ -159,7 +159,7 @@ final class VisibilityLayoutTests: XCTestCase {
         let cert = try certificate(fixture.all, evidence: evidence)
         XCTAssertTrue(cert.matches(snapshot(exchangeRows(fixture.all))))
         let reordered = fixture.all.map { item -> Window in
-            guard item.key.id == 101 else { return item }
+            guard item.key.number == 101 else { return item }
             return window(101, x: -260, y: -1440)
         }
         XCTAssertFalse(cert.matches(snapshot(reordered)))
@@ -177,9 +177,9 @@ final class VisibilityLayoutTests: XCTestCase {
         let fixture = differentFixedSlots
         let evidence = fixture.sources.map { icon($0, movable: $0.key.pid != 55) }
         let ambiguous = fixture.all + [window(141, x: 1000, y: -1440, width: 48, pid: 55)]
-        let openGap = replacing(fixture.all, WindowKey(pid: 55, id: 140),
+        let openGap = replacing(fixture.all, WindowKey(pid: 55, number: 140),
                                 with: window(140, x: -232, y: -1440, width: 48, pid: 55))
-        let wrongWidth = replacing(fixture.all, WindowKey(pid: 55, id: 140),
+        let wrongWidth = replacing(fixture.all, WindowKey(pid: 55, number: 140),
                                    with: window(140, x: -238, y: -1440, width: 40, pid: 55))
         for all in [ambiguous, openGap, wrongWidth] {
             XCTAssertNil(VerifiedVisibilityLayout(before: snapshot(all).keys, after: snapshot(all), icons: evidence))
@@ -239,7 +239,7 @@ final class VisibilityLayoutTests: XCTestCase {
         let ghost = window(90, x: 50)
         let cert = try certificate(projected + [ghost])
         XCTAssertFalse(cert.matches(snapshot(exchangeRows(projected) + [window(90, x: 50, onScreen: true)])))
-        let missingKnown = projected.filter { $0.key.id != 101 } + [window(90, x: -364, y: -1440)]
+        let missingKnown = projected.filter { $0.key.number != 101 } + [window(90, x: -364, y: -1440)]
         XCTAssertNil(VerifiedVisibilityLayout(before: snapshot(missingKnown).keys, after: snapshot(missingKnown), icons: icons(known)))
     }
 
@@ -249,10 +249,10 @@ final class VisibilityLayoutTests: XCTestCase {
         XCTAssertNil(VerifiedVisibilityLayout(before: snapshot(ambiguous).keys, after: snapshot(ambiguous), icons: icons(known)))
         let ghost = window(90, x: 50, y: -1440)
         let cert = try certificate(projected + [ghost])
-        let changed = replacing(projected, WindowKey(pid: 42, id: 101), with: window(101, x: 50, y: -1440))
+        let changed = replacing(projected, WindowKey(pid: 42, number: 101), with: window(101, x: 50, y: -1440))
         // Move both managed roles so their order still agrees; only the overlay
         // of CPU with the unchanged dormant ghost makes the match unsafe.
-        let keptOrder = replacing(changed, WindowKey(pid: 42, id: 102), with: window(102, x: 100, y: -1440))
+        let keptOrder = replacing(changed, WindowKey(pid: 42, number: 102), with: window(102, x: 100, y: -1440))
         XCTAssertFalse(cert.matches(snapshot(keptOrder + [ghost])))
     }
 
@@ -261,9 +261,9 @@ final class VisibilityLayoutTests: XCTestCase {
         XCTAssertNil(VerifiedVisibilityLayout(before: snapshot(duplicateAnchor).keys, after: snapshot(duplicateAnchor), icons: icons(known)))
         for missingID: UInt32 in [10, 11] {
             XCTAssertNil(VerifiedVisibilityLayout(before: snapshot(projected).keys, after: snapshot(projected),
-                icons: icons(known.filter { $0.key.id != missingID })))
+                icons: icons(known.filter { $0.key.number != missingID })))
         }
-        let missingAnchor = projected.filter { $0.key.id != 111 }
+        let missingAnchor = projected.filter { $0.key.number != 111 }
         XCTAssertNil(VerifiedVisibilityLayout(before: snapshot(missingAnchor).keys, after: snapshot(missingAnchor), icons: icons(known)))
     }
 
