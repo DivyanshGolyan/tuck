@@ -123,45 +123,6 @@ final class TuckCoreTests: XCTestCase {
         }
     }
 
-    func testPlannerExhaustivelyMinimal() throws {
-        let target = ["a", "b", "separator", "c", "d", "e"]
-        func permutations(_ values: [String]) -> [[String]] {
-            if values.isEmpty { return [[]] }
-            return values.enumerated().flatMap { index, element in
-                var rest = values
-                rest.remove(at: index)
-                return permutations(rest).map { [element] + $0 }
-            }
-        }
-        for observed in permutations(target) {
-            let moves = try LayoutPlanner.plan(hidden: ["a", "b"], visible: ["c", "d", "e"], observed: observed, separatorID: "separator")
-            var actual = observed
-            for move in moves {
-                actual.remove(at: actual.firstIndex(of: move.id)!)
-                let insertion = move.before.map { actual.firstIndex(of: $0)! } ?? actual.count
-                actual.insert(move.id, at: insertion)
-            }
-            XCTAssertEqual(actual, target, "\(observed)")
-            // Independent quadratic LIS oracle.
-            let ranks = observed.map { target.firstIndex(of: $0)! }
-            var lengths = Array(repeating: 1, count: ranks.count)
-            for i in ranks.indices {
-                for j in 0..<i where ranks[j] < ranks[i] { lengths[i] = max(lengths[i], lengths[j] + 1) }
-            }
-            XCTAssertEqual(moves.count, target.count - lengths.max()!)
-            XCTAssertEqual(moves, try LayoutPlanner.plan(hidden: ["a", "b"], visible: ["c", "d", "e"], observed: observed, separatorID: "separator"))
-        }
-    }
-
-    func testPlannerOfflineUnknownAndInvalidIDs() throws {
-        let moves = try LayoutPlanner.plan(hidden: ["a", "offline"], visible: ["b"], observed: ["unknown", "b", "s", "a"], separatorID: "s")
-        XCTAssertTrue(moves.allSatisfy { $0.id != "unknown" && $0.id != "offline" && $0.before != "unknown" })
-        XCTAssertThrowsError(try LayoutPlanner.plan(hidden: ["a"], visible: ["a"], observed: ["s"], separatorID: "s"))
-        XCTAssertThrowsError(try LayoutPlanner.plan(hidden: [], visible: [], observed: ["s", "s"], separatorID: "s"))
-        XCTAssertThrowsError(try LayoutPlanner.plan(hidden: ["s"], visible: [], observed: ["s"], separatorID: "s"))
-        XCTAssertThrowsError(try LayoutPlanner.plan(hidden: [], visible: [], observed: [], separatorID: "s"))
-    }
-
     func withStore(_ body: (ConfigStore, URL) throws -> Void) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -82,8 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var runtimeWork: Task<Void, Never>?
     // An effect is never replayed just because observation timed out. Resolve its
     // postcondition using fresh reads before deciding whether any new effect is safe.
-    private var unverifiedMove: MoveVerification?
-    private var moveAttempts = MoveAttempts()
+    private var history = MoveHistory()
     private var observerTargets: Set<pid_t> = []
 
     init(configURL: URL) {
@@ -180,8 +179,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         })
         notificationTokens.append(observe(NotificationCenter.default, NSApplication.didChangeScreenParametersNotification) { [weak self] _ in
-            // A different display arrangement can make an abandoned move possible.
-            self?.moveAttempts.reset()
             self?.request(significant: true)
         })
         for name in [NSWindow.didChangeScreenNotification, NSWindow.didMoveNotification] {
@@ -211,7 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 var previousPlacement = config
                 previousPlacement?.showHidden = loaded.config.showHidden
                 let visibilityOnly = previousPlacement == loaded.config
-                if !visibilityOnly { verifiedLayout = nil; moveAttempts.reset() }
+                if !visibilityOnly { verifiedLayout = nil }
                 config = loaded.config
                 desiredRevision += 1
                 backoff.reset()
@@ -238,7 +235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// a new/missing/reordered window falls back to normal reconciliation.
     private func hideVerifiedLayout(request: Int) async {
         guard let verifiedLayout else { fastHideReason = "no verified layout"; return }
-        guard unverifiedMove == nil else { fastHideReason = "move outcome unknown"; return }
+        guard !history.pending else { fastHideReason = "move outcome unknown"; return }
         guard accessibility else { fastHideReason = "permission not verified"; return }
         guard !observers.isMenuOpen, !mover.userIsBusy else { fastHideReason = "input or menu before check"; return }
         let generation = gate.generation
@@ -248,7 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard request == configRequest else { fastHideReason = "config changed during check"; return }
         guard generation == gate.generation else { fastHideReason = "work generation changed during check"; return }
         guard !terminating, !showHidden, !Mover.sessionIsLocked else { fastHideReason = "intent, lock or termination changed"; return }
-        guard unverifiedMove == nil, !observers.isMenuOpen, !mover.userIsBusy else { fastHideReason = "input, menu or move during check"; return }
+        guard !history.pending, !observers.isMenuOpen, !mover.userIsBusy else { fastHideReason = "input, menu or move during check"; return }
         if let reason = verifiedLayout.mismatchReason(fresh) { fastHideReason = reason; return }
         guard let config else { fastHideReason = "config missing"; return }
         let available = Set(snapshot.icons.filter(\.movable).map(\.id))
@@ -606,10 +603,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let previousWidth = separator.length
         var beganEffect = false
         var completed = false
+        var leaksRevealed = false
         defer {
             // A cancelled/failed preflight must not become an accidental reveal.
             // Never restore over a new reveal request or an uncertain input effect.
-            if !completed && !beganEffect && !showHidden && previousWidth > 100 && separator.length == 4 {
+            if !completed && !beganEffect && !leaksRevealed && !showHidden && previousWidth > 100 && separator.length == 4 {
                 separator.length = previousWidth
             }
         }
@@ -650,31 +648,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lap("ownIcons")
         let available = Set(fresh.icons.filter(\.movable).map(\.id))
         let hidden = config.hidden.filter { available.contains($0) }
-        let visible = config.visible.filter { available.contains($0) } + [Inventory.controlID]
-        var order = observed.map(\.id)
-        var plan = try LayoutPlanner.plan(hidden: hidden, visible: visible, observed: order, separatorID: Inventory.separatorID)
-        if var verification = unverifiedMove {
-            let decision = verification.observe(order: order, goalSatisfied: plan.isEmpty)
-            unverifiedMove = verification
-            switch decision {
-            case .verified: unverifiedMove = nil
-            case .wait:
-                throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting to verify previous move"))
-            case .awaitChange:
-                // Three unchanged reads resolve the outcome: the gesture had no
-                // effect. That permits a bounded fresh attempt, not a permanent stop.
-                unverifiedMove = nil
-                backoff.reset()
-                moveAttempts.fail(order: order,
-                    reason: "Could not move \(label(for: verification.itemID)); order left unchanged")
+        let visible = config.visible.filter { available.contains($0) }
+        func analyse(_ icons: [BarIcon]) throws -> Layout {
+            try Layout(order: icons.map(\.id), hidden: hidden, visible: visible,
+                       rows: Set(NSScreen.displayBounds.map(\.minY)).sorted(), label: label(for:))
+        }
+        func waitForMove() -> DeferredWork {
+            DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting to verify previous move"))
+        }
+        /// Order inside a group is cosmetic; only a leak keeps the separator from hiding.
+        func giveUp(on move: Move, reason: String) throws -> String {
+            switch move.purpose {
+            case .unblockHide:
+                separator.length = 4
+                leaksRevealed = true
+                throw DeferredWork(issue: WorkIssue(recovery: .awaitChange, message: reason + "; icons left accessible"))
+            case .tuck, .cosmetic:
+                return reason
             }
         }
-        var degraded: String?
-        var budget = max(4, observed.count * 2)
-        while !plan.isEmpty && budget > 0 {
+        var layout = try analyse(observed)
+        let wasPending = history.pending
+        history = history.observe(order: layout.order, goalMet: layout.next == nil)
+        if history.pending { throw waitForMove() }
+        if wasPending { backoff.reset() }
+        var note: String?
+        var budget = Limits.passSteps(managed: observed.count)
+        while let planned = layout.next {
             try check(token)
             // Checked before revealing, so an abandoned order never flickers.
-            if let reason = moveAttempts.abandoned(order: order) { degraded = reason; break }
+            if let reason = history.abandoned(planned) { note = try giveUp(on: planned, reason: reason); break }
+            guard budget > 0 else {
+                throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Layout pass budget reached; continuing later"))
+            }
             try requireQuietInput()
             separator.length = 4
             phase = "applying"; writeRuntime()
@@ -683,18 +689,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             observed = try await managedIcons(fresh)
             try check(token)
             let byID = Dictionary(uniqueKeysWithValues: observed.map { ($0.id, $0) })
-            order = observed.map(\.id)
-            plan = try LayoutPlanner.plan(hidden: hidden, visible: visible, observed: order, separatorID: Inventory.separatorID)
-            guard let move = plan.first, let icon = byID[move.id] else { break }
-            if let reason = moveAttempts.abandoned(order: order) { degraded = reason; break }
+            layout = try analyse(observed)
+            guard let move = layout.next, let icon = byID[move.id] else { break }
+            if let reason = history.abandoned(move) { note = try giveUp(on: move, reason: reason); break }
             let managedRight = observed.map { $0.frame.maxX }.max() ?? 0
             let fixed = fresh.icons.filter { !$0.movable && $0.frame.minX >= managedRight - 1 }.map { $0.frame.minX }.min()
             let edge = fixed.map { $0 - 1 } ?? managedRight - 1
-            let before = order
             let anchor = move.before.flatMap { byID[$0] }
             if icon.id == Inventory.separatorID || icon.id == Inventory.controlID {
                 beganEffect = true
-                unverifiedMove = MoveVerification(itemID: move.id, before: before)
+                history = history.record(.began(move))
                 try await placeOwnedItem(icon.id == Inventory.separatorID ? separator : control,
                     icon: icon, before: anchor, rightEdge: edge)
             } else {
@@ -703,13 +707,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         isCurrent: { [weak self] in self?.gate.isCurrent(token: token) == true && self?.terminating == false },
                         didBegin: { [weak self] in
                             beganEffect = true
-                            self?.unverifiedMove = MoveVerification(itemID: move.id, before: before)
+                            if let self { self.history = self.history.record(.began(move)) }
                         })
-                } catch let failure as MovementFailure where failure.recovery == .awaitChange && unverifiedMove == nil {
+                } catch let failure as MovementFailure where failure.recovery == .awaitChange && !history.pending {
                     // Nothing was posted and retrying cannot help (for example an
-                    // icon behind the notch). Give up on this order, not on hiding.
-                    moveAttempts.fail(order: order, reason: failure.message, final: true)
-                    degraded = failure.message
+                    // icon behind the notch).
+                    history = history.record(.refused(move, reason: failure.message, permanent: true))
+                    note = try giveUp(on: move, reason: failure.message)
                     break
                 }
             }
@@ -717,26 +721,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try check(token)
             let after = try await scan(token: token); try requireComplete(after)
             snapshot = after; fresh = after
-            order = try await managedIcons(after).map(\.id)
-            if order == before {
-                throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting to verify previous move"))
-            }
-            unverifiedMove = nil
-            plan = try LayoutPlanner.plan(hidden: hidden, visible: visible, observed: order, separatorID: Inventory.separatorID)
+            observed = try await managedIcons(after)
+            layout = try analyse(observed)
+            history = history.observe(order: layout.order, goalMet: layout.next == nil)
+            if history.pending { throw waitForMove() }
         }
-        if !plan.isEmpty {
-            guard let degraded else {
-                throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Layout pass budget reached; continuing later"))
-            }
-            // Order inside a group is cosmetic. Hiding only requires that nothing
-            // meant to stay visible sits left of the boundary; a hidden-group icon
-            // stranded on the right merely stays visible.
-            let keep = Set(visible)
-            guard let boundaryIndex = order.firstIndex(of: Inventory.separatorID),
-                  !order[..<boundaryIndex].contains(where: keep.contains) else {
-                throw DeferredWork(issue: WorkIssue(recovery: .awaitChange, message: degraded + "; icons left accessible"))
-            }
-        }
+        assert(layout.leaks.isEmpty, "Hiding requires no visible-group icon left of the separator")
         try check(token)
         guard desiredRevision == revision else { throw CancellationError() }
         try requireQuietInput()
@@ -758,7 +748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reconcilePhases = phases
         lastReconcileMS = phases.values.reduce(0, +)
         completed = true
-        return plan.isEmpty ? nil : degraded
+        return note
     }
 
     private func issue(for error: Error) -> WorkIssue {
