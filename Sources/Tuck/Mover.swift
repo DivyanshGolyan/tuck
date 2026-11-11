@@ -2,33 +2,14 @@ import AppKit
 import ApplicationServices
 import TuckCore
 
-/// One icon as Mover takes it. All coordinates are CoreGraphics global display coordinates.
-struct BarIcon: Sendable {
-    let id: String
-    let metadata: ItemMetadata
-    let pid: pid_t
-    let windowID: CGWindowID
-    let frame: CGRect
-    let movable: Bool
-}
-
-extension NSScreen {
-    /// Every attached display, in CoreGraphics global coordinates.
-    static var displayBounds: [CGRect] {
-        screens.compactMap { screen in
-            (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { CGDisplayBounds($0.uint32Value) }
-        }
-    }
-}
-
 struct MovementFailure: LocalizedError {
     let message: String
     var recovery: Recovery = .awaitChange
     var errorDescription: String? { message }
 }
 
-// The platform mechanism is kept here. Planning never knows about coordinates,
-// mouse events, delays, or accessibility objects.
+// The platform mechanism is kept here: mouse events, delays and cleanup. Which points
+// to drag between is decided by `assess`.
 @MainActor
 final class Mover {
     static let eventTag: Int64 = 0x5455434B
@@ -48,56 +29,14 @@ final class Mover {
         return !flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty
     }
 
-    private func points(for icon: BarIcon, anchor: BarIcon?, rightEdge: CGFloat) async throws -> (CGPoint, CGPoint) {
-        struct Display { let frame: CGRect; let usableLeft: CGFloat }
-        let displays: [Display] = NSScreen.screens.compactMap { screen in
-            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
-            let frame = CGDisplayBounds(number.uint32Value)
-            return Display(frame: frame, usableLeft: screen.auxiliaryTopRightArea?.minX ?? frame.minX + 180)
-        }
-        guard let originalDisplay = displays.first(where: { abs($0.frame.minY - icon.frame.minY) < 2 }) else {
-            throw MovementFailure(message: "Menu bar display unavailable")
-        }
-        let sourceGap = originalDisplay.frame.maxX - icon.frame.maxX
-        let targetX = anchor.map { $0.frame.minX - 2 } ?? rightEdge
-        let targetGap = originalDisplay.frame.maxX - targetX
-        return try await SerialWorker.system.run {
-        let windows = (try? WindowList.readSkippingMalformed())?.list.windows ?? []
-        // Prefer the current row. A narrow/notched display can have status windows
-        // that exist but cannot receive physical hits. Use a visible mirrored row
-        // on another attached display, without changing the configured layout.
-        let ordered = displays.sorted {
-            let a = abs($0.frame.minY - originalDisplay.frame.minY) < 2
-            let b = abs($1.frame.minY - originalDisplay.frame.minY) < 2
-            return a != b ? a : $0.frame.width > $1.frame.width
-        }
-        for display in ordered {
-            let end = CGPoint(x: display.frame.maxX - targetGap, y: display.frame.minY + 12)
-            guard end.x >= display.usableLeft, end.x < display.frame.maxX else { continue }
-            let matches = windows.compactMap { window -> CGRect? in
-                let frame = window.frame
-                guard window.key.pid == icon.pid,
-                      abs(frame.minY - display.frame.minY) < 2,
-                      abs(frame.width - icon.frame.width) < 2,
-                      abs((display.frame.maxX - frame.maxX) - sourceGap) < 2,
-                      frame.midX >= display.usableLeft else { return nil }
-                return frame
-            }
-            guard matches.count == 1, let frame = matches.first else { continue }
-            return (CGPoint(x: frame.midX, y: frame.midY), CGPoint(x: end.x, y: frame.midY))
-        }
-        throw MovementFailure(message: "Icon overflows the available menu bar; use a wider display")
-        }
-    }
-
-    func move(_ icon: BarIcon, before anchor: BarIcon?, rightEdge: CGFloat, tap: CGEventTapLocation = .cghidEventTap, isCurrent: () -> Bool = { true }, didBegin: () -> Void = {}) async throws {
-        guard AXIsProcessTrusted(), icon.movable else { throw MovementFailure(message: "Cannot move \(icon.metadata.label)") }
+    /// Posts one Command-drag between points the verdict already resolved as hittable.
+    func move(_ drag: Drag, label: String, tap: CGEventTapLocation = .cghidEventTap, isCurrent: () -> Bool = { true }, didBegin: () -> Void = {}) async throws {
+        guard AXIsProcessTrusted() else { throw MovementFailure(message: "Cannot move \(label)") }
         guard !userIsBusy else { throw MovementFailure(message: "User input in progress; layout deferred", recovery: .retry) }
         guard let source = CGEventSource(stateID: .hidSystemState), let original = CGEvent(source: nil)?.location else {
             throw MovementFailure(message: "Cannot create mouse event source")
         }
-        let (start, end) = try await points(for: icon, anchor: anchor, rightEdge: rightEdge)
-        guard NSScreen.displayBounds.contains(where: { $0.contains(start) && $0.contains(end) }) else { throw MovementFailure(message: "Icon is outside the accessible menu bar") }
+        let (start, end) = (drag.from, drag.to)
         var released = false
         var pressed = false
         var lastPosition = original

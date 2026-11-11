@@ -9,8 +9,234 @@ public enum Limits {
     public static let unchangedReads = 3
     /// Strikes on one attempt key before its moves are abandoned.
     public static let attempts = 2
-    /// Moves one pass may post.
-    public static func passSteps(managed: Int) -> Int { max(4, 2 * managed) }
+    /// Gather-and-assess iterations one pass may run: a budget of max(4, 2 x managed)
+    /// moves, plus the reveal settle and the final observation.
+    public static func passSteps(managed: Int) -> Int { max(4, 2 * managed) + 2 }
+}
+
+// MARK: - Assess
+
+/// Decides the whole pass from one observation. Every input yields a verdict.
+///
+/// Precedence, first match wins:
+///  1. bar incomplete                       -> stop(first retry issue, else first issue); boundary keep
+///  2. config alias collision               -> stop(retry "Ambiguous config alias: <id>")
+///  3. icons not in config.items            -> register(discovered, observed order)
+///  4. the observation leaves a move pending -> stop(retry "Waiting to verify previous move")
+///  5. leaks, first required move abandoned -> stop(awaitChange "<reason>; icons left accessible"); boundary reveal
+///  6. a move left, not abandoned:
+///       boundary hidden on the bar         -> settleThenGather; boundary reveal
+///       no hittable replica                -> strike its key to the limit, continue at 5 or 7
+///       otherwise                          -> move(first by purpose); boundary reveal
+///  7. otherwise                            -> done(note: abandoned reason or nil); boundary
+///                                             hide iff !showHidden and a hidden-group icon is
+///                                             present, else reveal
+/// On 1-4 the boundary is `.reveal` when config.showHidden: a reveal never waits.
+public func assess(_ config: TuckConfig, _ bar: MenuBar, _ history: MoveHistory) -> Verdict {
+    let held: Boundary = config.showHidden ? .reveal : .keep
+    guard bar.complete, let reference = bar.referenceRow else {
+        let issue = bar.rows.fault.map { WorkIssue(recovery: .retry, message: $0) }
+            ?? bar.issues.first { $0.recovery == .retry } ?? bar.issues.first
+            ?? WorkIssue(recovery: .retry, message: "Waiting for a coherent active menu bar")
+        return Verdict(boundary: held, next: .stop(issue), history: history, layout: nil)
+    }
+    let roster = Roster(bar, items: config.items)
+    if let issue = roster.aliases?.issue {
+        return Verdict(boundary: held, next: .stop(issue), history: history, layout: nil)
+    }
+    if roster.icons.contains(where: { config.items[$0.id] == nil }) {
+        let discovered = Dictionary(uniqueKeysWithValues: roster.icons.map { ($0.id, $0.metadata) })
+        return Verdict(boundary: held, next: .register(discovered, order: roster.icons.map(\.id)), history: history, layout: nil)
+    }
+
+    let available = Set(roster.icons.filter(\.role.movable).map(\.id))
+    let hidden = config.hidden.filter(available.contains)
+    let layout: Layout
+    do {
+        layout = try Layout(order: roster.order, hidden: hidden, visible: config.visible.filter(available.contains),
+                            rows: bar.rows.rows, displays: bar.rows.displays,
+                            label: { OwnItem(rawValue: $0) != nil ? "Tuck's own item" : config.items[$0]?.label ?? $0 })
+    } catch {
+        return Verdict(boundary: held, next: .stop(WorkIssue(recovery: .awaitChange, message: String(describing: error))),
+                       history: history, layout: nil)
+    }
+
+    var history = history.observe(order: layout.order, goalMet: layout.next == nil)
+    if history.pending {
+        return Verdict(boundary: held, next: .stop(WorkIssue(recovery: .retry, message: "Waiting to verify previous move")),
+                       history: history, layout: layout)
+    }
+    if let planned = layout.next, history.abandoned(planned) == nil {
+        guard bar.rows.boundaryRevealed else {
+            return Verdict(boundary: .reveal, next: .settleThenGather, history: history, layout: layout)
+        }
+        switch roster.subject(for: planned, reference: reference) {
+        case .reachable(let subject):
+            return Verdict(boundary: .reveal, next: .move(planned, subject), history: history, layout: layout)
+        case .unreachable(let reason):
+            history = history.record(.refused(planned, reason: reason, permanent: true))
+        }
+    }
+    var note: String?
+    if let planned = layout.next, let reason = history.abandoned(planned) {
+        guard planned.purpose != .unblockHide else {
+            return Verdict(boundary: .reveal, next: .stop(WorkIssue(recovery: .awaitChange, message: reason + "; icons left accessible")),
+                           history: history, layout: layout)
+        }
+        note = reason
+    }
+    assert(layout.leaks.isEmpty, "Only an unblockHide move removes a leak")
+    let boundary: Boundary
+    if !config.showHidden, !hidden.isEmpty, let proof = Separated(layout) { boundary = .hide(proof) } else { boundary = .reveal }
+    return Verdict(boundary: boundary, next: .done(note: note), history: history, layout: layout)
+}
+
+// MARK: - Verdict
+
+public struct Verdict: Sendable {
+    /// What the separator must be after this step. The shell applies it before `next`.
+    public let boundary: Boundary
+    public let next: Next
+    /// The history with this observation folded in. The shell stores it unconditionally.
+    public let history: MoveHistory
+    /// nil when the bar was incomplete, ambiguous or unregistered.
+    public let layout: Layout?
+}
+
+public enum Boundary: Equatable, Sendable {
+    case keep
+    case reveal
+    case hide(Separated)
+}
+
+/// Proof that no visible-group icon is left of the separator in a complete observed bar.
+public struct Separated: Equatable, Sendable {
+    fileprivate init?(_ layout: Layout) {
+        guard layout.leaks.isEmpty else { return nil }
+    }
+}
+
+public enum Next: Sendable {
+    /// The pass applied. `note` names an abandoned order, as `lastError`.
+    case done(note: String?)
+    case stop(WorkIssue)
+    /// Write these icons through ConfigStore.registerSnapshot, then wait for the watcher.
+    case register([String: ItemMetadata], order: [String])
+    /// The boundary is about to be revealed; let WindowServer settle, then gather.
+    case settleThenGather
+    /// Perform exactly this move, then gather. Never returned while a move is pending.
+    case move(Move, Subject)
+}
+
+/// How the shell performs a move, resolved against this observation's frames.
+public enum Subject: Equatable, Sendable {
+    /// Tuck's own item: lower its preferred position by `shift` points.
+    case own(OwnItem, shift: CGFloat)
+    /// Another app's icon: a Command-drag between two hittable points.
+    case icon(Drag)
+}
+
+public struct Drag: Equatable, Sendable {
+    public let from: CGPoint
+    public let to: CGPoint
+}
+
+// MARK: - Roster
+
+/// Other apps' icons under config ids, left to right on the reference row.
+public struct Roster: Sendable {
+    public struct Icon: Sendable {
+        public let id: String
+        public let role: Role
+        /// On the reference row, else on the first row the icon has a window on.
+        public let frame: CGRect
+        let onReference: Bool
+        public var metadata: ItemMetadata {
+            ItemMetadata(bundleID: role.identity.bundle, label: role.label, item: role.identity.item, movable: role.movable)
+        }
+    }
+
+    public let icons: [Icon]
+    /// Ids more than one icon resolved to; their icons are left out of `icons`.
+    public var collisions: [String] { aliases?.collisions ?? [] }
+    let aliases: Aliases?
+    private let bar: MenuBar
+
+    /// Without `items`, ids are identity keys.
+    public init(_ bar: MenuBar, items: [String: ItemMetadata]?) {
+        self.bar = bar
+        let reference = bar.referenceRow
+        let located = bar.roles.compactMap { role -> (role: Role, frame: CGRect, onReference: Bool)? in
+            for row in (reference.map { [$0] } ?? []) + Array(bar.rows.rows.indices) {
+                if let frame = bar.frame(of: role, row: row) { return (role, frame, row == reference) }
+            }
+            return nil
+        }
+        let aliases = items.map { Aliases(located.map(\.role.identity), items: $0) }
+        icons = located.enumerated().compactMap { index, entry in
+            let id = aliases == nil ? entry.role.identity.key : aliases!.ids[index]
+            return id.map { Icon(id: $0, role: entry.role, frame: entry.frame, onReference: entry.onReference) }
+        }
+        self.aliases = aliases
+    }
+
+    /// Movable icons and Tuck's own items on the reference row, left to right.
+    var order: [String] {
+        guard let row = bar.referenceRow else { return [] }
+        let own = OwnItem.allCases.map { ($0.id, ownFrame($0, row: row).minX) }
+        return (icons.filter { $0.role.movable && $0.onReference }.map { ($0.id, $0.frame.minX) } + own)
+            .sorted { $0.1 < $1.1 }.map(\.0)
+    }
+
+    private func ownFrame(_ item: OwnItem, row: Int) -> CGRect {
+        (item == .separator ? bar.rows.separator : bar.rows.control)[row].frame
+    }
+
+    private func frame(of id: String, row: Int) -> CGRect? {
+        if let own = OwnItem(rawValue: id) { return ownFrame(own, row: row) }
+        return icons.first { $0.id == id }.flatMap { bar.frame(of: $0.role, row: row) }
+    }
+
+    /// Just left of the first fixed icon right of every managed icon on the row.
+    private func rightEdge(row: Int) -> CGFloat {
+        let managed = icons.filter(\.role.movable).compactMap { bar.frame(of: $0.role, row: row) }
+            + OwnItem.allCases.map { ownFrame($0, row: row) }
+        let right = managed.map(\.maxX).max() ?? 0
+        let fixed = icons.filter { !$0.role.movable }.compactMap { bar.frame(of: $0.role, row: row)?.minX }.filter { $0 >= right - 1 }
+        return (fixed.min() ?? right) - 1
+    }
+
+    enum Resolution: Equatable { case reachable(Subject), unreachable(String) }
+
+    /// Own items shift on the reference row. Another app's icon is dragged on the
+    /// reference row, else on a wider display's row: the first replica whose midpoint
+    /// and drop point are right of the display's usable left edge (the notch) and on it.
+    func subject(for move: Move, reference: Int) -> Resolution {
+        if let own = OwnItem(rawValue: move.id) {
+            let target = move.before.flatMap { frame(of: $0, row: reference)?.minX } ?? rightEdge(row: reference)
+            return .reachable(.own(own, shift: target - ownFrame(own, row: reference).maxX))
+        }
+        let rows = bar.rows
+        // Mirrored displays share a row; each is tried with its own usable edge.
+        let replicas = rows.rows.indices.flatMap { row -> [(row: Int, window: CGRect, display: Display)] in
+            guard let window = frame(of: move.id, row: row) else { return [] }
+            return rows.displays.filter {
+                abs($0.frame.minY - window.minY) < 2 && $0.frame.minX <= window.midX && window.midX < $0.frame.maxX
+            }.map { (row, window, $0) }
+        }.sorted { ($0.row == reference ? 0 : 1, -$0.display.frame.width, $0.row) < ($1.row == reference ? 0 : 1, -$1.display.frame.width, $1.row) }
+        guard !replicas.isEmpty else { return .unreachable("Menu bar display unavailable") }
+        for replica in replicas {
+            let end: CGFloat?
+            if let before = move.before { end = frame(of: before, row: replica.row).map { $0.minX - 2 } } else { end = rightEdge(row: replica.row) }
+            guard let end else { continue }
+            let from = CGPoint(x: replica.window.midX, y: replica.window.midY)
+            let to = CGPoint(x: end, y: replica.window.midY)
+            let usable = replica.display.usableLeft
+            guard from.x >= usable, to.x >= usable, replica.display.frame.contains(from), replica.display.frame.contains(to) else { continue }
+            return .reachable(.icon(Drag(from: from, to: to)))
+        }
+        return .unreachable("Icon overflows the available menu bar; use a wider display")
+    }
 }
 
 // MARK: - Config ids
@@ -72,12 +298,19 @@ public enum Purpose: Equatable, Sendable {
     case cosmetic
 }
 
-/// The evidence a move was planned against. Any change of observed order, placement
-/// or display rows is a new key, so strikes never need a manual reset.
-struct AttemptKey: Hashable, Sendable {
+/// The evidence a move was planned against. Any change of observed order, placement,
+/// menu rows or displays is a new key, so strikes never need a manual reset. Displays
+/// count on their own: a wider display can replace a narrow one at the same height.
+struct AttemptKey: Equatable, Sendable {
     let order: [String]
     let target: [String]
     let rows: [CGFloat]
+    let displays: [Display]
+
+    init(order: [String], target: [String], rows: [CGFloat], displays: [Display] = []) {
+        self.order = order; self.target = target; self.rows = rows
+        self.displays = displays.sorted { ($0.frame.minY, $0.frame.minX) < ($1.frame.minY, $1.frame.minX) }
+    }
 }
 
 public struct Move: Equatable, Sendable {
@@ -110,7 +343,7 @@ public struct Layout: Equatable, Sendable {
     public var next: Move? { required.first ?? tuck.first ?? cosmetic.first }
 
     /// `visible` excludes the control, which always ends the visible group.
-    public init(order: [String], hidden: [String], visible: [String], rows: [CGFloat],
+    public init(order: [String], hidden: [String], visible: [String], rows: [CGFloat], displays: [Display] = [],
                 label: (String) -> String = { $0 }) throws {
         var placed: Set<String> = [OwnItem.control.id]
         for id in hidden + visible {
@@ -123,7 +356,7 @@ public struct Layout: Equatable, Sendable {
         }
         guard present.contains(OwnItem.separator.id) else { throw LayoutError.missingSeparator }
         let partition = Partition(order: order, hidden: hidden, visible: visible)
-        let key = AttemptKey(order: order, target: partition.target, rows: rows)
+        let key = AttemptKey(order: order, target: partition.target, rows: rows, displays: displays)
         let planned = plan(order: order, hidden: hidden, visible: visible)
         self.order = order
         target = partition.target
