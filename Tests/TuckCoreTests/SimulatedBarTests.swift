@@ -33,6 +33,8 @@ struct ToyBar {
     var activeRow = 0
     var restarts: [String: Int] = [:]
     var bundles: [String: String] = [:]
+    /// An app that renamed its status item keeps its windows; only AX shows the change.
+    var items: [String: String] = [:]
     var ghosts: [StatusWindow] = []
     var omitSeparator = false
     /// A move whose effect becomes visible only at a later gather.
@@ -59,6 +61,8 @@ struct ToyBar {
     var apps: [String] { order.filter { OwnItem(rawValue: $0) == nil } }
     func pid(_ id: String) -> Int32 { 100 + Int32(id.dropFirst())! }
     func bundle(_ id: String) -> String { bundles[id] ?? "app." + id }
+    func identity(_ id: String) -> IconIdentity { id == "clock" ? Self.clock : IconIdentity(bundle: bundle(id), item: items[id]) }
+    func id(of pid: Int32) -> String { pid == Self.clockPID ? "clock" : apps.first { self.pid($0) == pid }! }
 
     private func width(_ id: String) -> CGFloat {
         id == Self.separator ? (hidden ? 10_000 : 4) : id == Self.control ? 20 : 30
@@ -114,19 +118,25 @@ struct ToyBar {
     func readings(for stale: [Int32: String], failing: Set<Int32> = []) -> [AppReading] {
         running.filter { stale[$0.pid] != nil }.map { app in
             if failing.contains(app.pid) { return .failed(app, WorkIssue(recovery: .retry, message: "timed out")) }
-            let id = app.pid == Self.clockPID ? "clock" : apps.first { pid($0) == app.pid }!
-            let identity = id == "clock" ? Self.clock : IconIdentity(bundle: app.bundle, item: nil)
+            let id = id(of: app.pid)
             return AppReading(app: app, outcome: .clean([AppReading.BoundIcon(
-                identity: identity, label: id == "clock" ? "Clock" : app.name, movable: id != "clock",
+                identity: identity(id), label: id == "clock" ? "Clock" : app.name, movable: id != "clock",
                 window: key(id, row: activeRow), element: 0)]))
         }
     }
 
-    /// The shell's gather: one list, AX only for stale apps (none in observe-only reach).
+    /// The shell's gather: one list, one survey, AX only for stale apps (none in observe-only reach).
     func gather(after previous: MenuBar, failing: Set<Int32> = [], observeOnly: Bool = false) -> MenuBar {
-        let rows = rows()
-        let readings = observeOnly ? [] : readings(for: previous.staleApps(in: rows, running: running), failing: failing)
-        return MenuBar.observe(rows, running: running, readings: readings, previous: previous)
+        let survey = previous.survey(rows(), running: running)
+        return MenuBar.observe(survey, readings: observeOnly ? [] : readings(for: survey.stale, failing: failing))
+    }
+
+    /// The shell's audit after an applied pass: re-read `bar.auditTarget` on the bar's
+    /// own rows and fold the reading back in.
+    func audit(_ bar: MenuBar, failing: Bool = false) -> MenuBar {
+        guard let target = bar.auditTarget else { return bar }
+        let survey = bar.survey(bar.rows, running: running)
+        return MenuBar.observe(survey, readings: readings(for: [target.pid: "audit"], failing: failing ? [target.pid] : []))
     }
 
     mutating func apply(_ boundary: Boundary) {
@@ -192,7 +202,10 @@ struct Simulation {
     private let faultSteps: Int
     private let notched: Bool
     private var rates: [String: Double] = [:]
-    private var dropped = 0, refused = 0
+    private var dropped = 0, refused = 0, renames = 0
+    /// Set by a disagreeing audit: the pass it requests does not audit, as in Reconciler.
+    private var auditHeld = false
+    private(set) var audits = 0, auditMismatches = 0, auditFailures = 0
 
     init(seed: UInt64) {
         self.seed = seed
@@ -214,7 +227,8 @@ struct Simulation {
         let unregistered = Set((ids + ["clock"]).filter { _ in rng.chance(0.15) })
         config = ToyBar.config(hidden: hidden, visible: visible, unregistered: unregistered, showHidden: rng.chance(0.2))
         faultSteps = Int.random(in: 0...24, using: &rng)
-        for name in ["drop", "late", "reorder", "restart", "ghost", "active", "ax", "list", "rows", "refuse", "observeOnly"] {
+        for name in ["drop", "late", "reorder", "restart", "ghost", "active", "ax", "list", "rows", "refuse", "observeOnly",
+                     "rename", "auditFail"] {
             rates[name] = rng.chance(0.5) ? Double(Int.random(in: 0...30, using: &rng)) / 100 : 0
         }
         self.rng = rng
@@ -249,6 +263,10 @@ struct Simulation {
             toy.place(id, before: toy.order.filter { $0 != id }.randomElement(using: &rng))
         }
         if fault("restart", faulty), let id = toy.apps.randomElement(using: &rng) { toy.restarts[id, default: 0] += 1 }
+        if fault("rename", faulty), let id = toy.apps.randomElement(using: &rng) {
+            renames += 1
+            toy.items[id] = "r\(renames)"
+        }
         if fault("active", faulty) { toy.activeRow = Int.random(in: 0..<toy.displays.count, using: &rng) }
         if fault("ghost", faulty), let id = toy.apps.randomElement(using: &rng) {
             if toy.ghosts.isEmpty {
@@ -320,6 +338,7 @@ struct Simulation {
             switch verdict.next {
             case .done:
                 steps = 0
+                if auditHeld { auditHeld = false } else if audit(faulty) { auditHeld = true; break }
                 if !faulty { terminal = verdict }
             case .stop(let issue):
                 steps = 0
@@ -351,6 +370,39 @@ struct Simulation {
         return failures
     }
 
+    /// The post-apply audit, checked every time it runs: a failed read makes the app stale
+    /// on the next list, a disagreement happens exactly when the carried identity is no
+    /// longer what AX says and leaves AX's identity bound, and an agreement changes
+    /// nothing but whose turn is next. True when it asks for another pass.
+    private mutating func audit(_ faulty: Bool) -> Bool {
+        guard let target = bar.auditTarget else { return false }
+        let before = bar
+        let failing = fault("auditFail", faulty)
+        bar = toy.audit(before, failing: failing)
+        audits += 1
+        let truth = toy.identity(toy.id(of: target.pid))
+        let carried = before.roles.filter { $0.pid == target.pid }.map(\.identity)
+        if failing {
+            auditFailures += 1
+            expect(bar.auditMismatches == before.auditMismatches, "audit: a failed read counted as a mismatch")
+            expect(bar.survey(toy.rows(), running: toy.running).stale[target.pid] != nil,
+                   "audit: a failed audit left \(target.name) reusable")
+            return false
+        }
+        if bar.auditMismatches > before.auditMismatches {
+            auditMismatches += 1
+            expect(carried != [truth], "audit: a mismatch for a binding that matched AX")
+            expect(bar.roles.filter { $0.pid == target.pid }.map(\.identity) == [truth], "audit: a mismatch left \(carried) bound")
+            return true
+        }
+        expect(carried == [truth], "audit: agreed with \(carried) while AX says \(truth)")
+        expect(bar.order == before.order && bar.issues == before.issues && bar.reusable == before.reusable
+               && bar.roles.map(\.identity) == before.roles.map(\.identity), "audit: an agreeing audit changed the bar")
+        expect(bar.auditTarget?.pid != target.pid || before.bindings.values.filter(\.reusable).count == 1,
+               "audit: the target did not rotate")
+        return false
+    }
+
     /// Liveness, once per run, after the last fault.
     private mutating func checkLiveness(_ terminal: Verdict?) {
         guard let terminal, let layout = terminal.layout else {
@@ -375,7 +427,7 @@ struct Simulation {
         for _ in 0..<2 {
             let rows = toy.rows()
             if case .done = terminal.next {
-                expect(bar.staleApps(in: rows, running: toy.running).isEmpty, "replay reads an app")
+                expect(bar.survey(rows, running: toy.running).stale.isEmpty, "replay reads an app")
             }
             bar = toy.gather(after: bar)
             let again = assess(config, bar, history)
@@ -392,13 +444,19 @@ struct Simulation {
 
 final class SimulatedBarTests: XCTestCase {
     func testSeededRunsKeepSafetyAndSettle() {
+        var audits = 0, mismatches = 0, failures = 0
         for seed in UInt64(0)..<300 {
             var simulation = Simulation(seed: seed)
-            let failures = simulation.run()
-            if let first = failures.first {
-                XCTFail("seed \(seed): \(first) (\(failures.count) failures; rerun Simulation(seed: \(seed)).run())")
+            let found = simulation.run()
+            if let first = found.first {
+                XCTFail("seed \(seed): \(first) (\(found.count) failures; rerun Simulation(seed: \(seed)).run())")
             }
+            audits += simulation.audits; mismatches += simulation.auditMismatches; failures += simulation.auditFailures
         }
+        // Every audit outcome ran somewhere in the seeds.
+        XCTAssertGreaterThan(mismatches, 0)
+        XCTAssertGreaterThan(failures, 0)
+        XCTAssertGreaterThan(audits, mismatches + failures)
     }
 
     func testReplayingAPassPlansNothing() {
@@ -419,7 +477,7 @@ final class SimulatedBarTests: XCTestCase {
         }
         XCTAssertEqual(toy.order, ["a0", "a1", ToyBar.separator, ToyBar.control])
         for _ in 0..<2 {
-            XCTAssertEqual(bar.staleApps(in: toy.rows(), running: toy.running), [:])
+            XCTAssertEqual(bar.survey(toy.rows(), running: toy.running).stale, [:])
             bar = toy.gather(after: bar)
             let verdict = assess(config, bar, history)
             XCTAssertEqual(verdict.history, history)
@@ -436,7 +494,7 @@ final class SimulatedBarTests: XCTestCase {
         XCTAssertEqual(verdict.boundary, .reveal)
 
         config.showHidden = false
-        XCTAssertEqual(bar.staleApps(in: toy.rows(), running: toy.running), [:])
+        XCTAssertEqual(bar.survey(toy.rows(), running: toy.running).stale, [:])
         bar = toy.gather(after: bar, observeOnly: true)
         XCTAssertTrue(bar.complete)
         verdict = assess(config, bar, verdict.history)
@@ -460,7 +518,7 @@ final class SimulatedBarTests: XCTestCase {
         let bar = toy.gather(after: .none)
         XCTAssertTrue(bar.complete)
         toy.activeRow = 1
-        XCTAssertEqual(bar.staleApps(in: toy.rows(), running: toy.running), [:])
+        XCTAssertEqual(bar.survey(toy.rows(), running: toy.running).stale, [:])
         let next = toy.gather(after: bar)
         XCTAssertTrue(next.complete)
         XCTAssertEqual(next.order, bar.order)

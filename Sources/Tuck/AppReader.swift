@@ -89,7 +89,7 @@ final class AppReader: @unchecked Sendable {
     }
 
     private func everyWindow(of pid: pid_t) throws -> [StatusWindow] {
-        do { return try WindowList.readSkippingMalformed().list.windows.filter { $0.key.pid == pid } }
+        do { return try WindowList.read().list.windows.filter { $0.key.pid == pid } }
         catch { throw AXReadFailure("Window inventory temporarily unavailable") }
     }
 

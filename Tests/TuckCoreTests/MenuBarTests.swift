@@ -1,6 +1,6 @@
 import CoreGraphics
 import XCTest
-import TuckCore
+@testable import TuckCore
 
 final class MenuBarTests: XCTestCase {
     private func key(_ number: UInt32) -> WindowKey { WindowKey(pid: 42, number: number) }
@@ -52,25 +52,28 @@ final class MenuBarTests: XCTestCase {
         XCTAssertNil(matchWindow(frame, candidates: [candidate], used: [key(16)]))
     }
 
-    func testOwnedReplicaUsesNamedRoleAndUniqueWidthOnRequestedRow() {
-        let source = window(1, CGRect(x: 1928, y: -1440, width: 36, height: 24), title: OwnItem.control.title)
+    func testOwnItemsAreTheNamedSourceAndItsSameWidthReplicaOnEachRow() {
+        let control = window(1, CGRect(x: 1928, y: -1440, width: 36, height: 24), title: OwnItem.control.title)
         let replica = window(2, CGRect(x: 1514, y: 0, width: 36, height: 37))
-        let separator = window(3, CGRect(x: -3632, y: 0, width: 5016, height: 37), onScreen: false)
-        let candidates = [source, replica, separator]
-        XCTAssertEqual(ownedStatusWindow(title: "TuckControl", menuY: -1440, candidates: candidates)?.key, key(1))
-        XCTAssertEqual(ownedStatusWindow(title: "TuckControl", menuY: 0, candidates: candidates)?.key, key(2))
-        XCTAssertNil(ownedStatusWindow(title: "Missing", menuY: 0, candidates: candidates))
-        XCTAssertNil(ownedStatusWindow(title: "TuckControl", menuY: 500, candidates: candidates))
-        XCTAssertNil(ownedStatusWindow(title: "TuckControl", menuY: 0,
-            candidates: candidates + [window(4, replica.frame, onScreen: false)]))
-        XCTAssertNil(ownedStatusWindow(title: "TuckControl", menuY: 0, candidates: candidates + [source]))
-    }
-
-    func testOwnedHiddenSeparatorReplicaMayBeOffscreen() {
-        let source = window(1, CGRect(x: -3266, y: -1440, width: 5016, height: 24), onScreen: false,
-                            title: OwnItem.separator.title)
-        let replica = window(2, CGRect(x: -3632, y: 0, width: 5016, height: 37), onScreen: false)
-        XCTAssertEqual(ownedStatusWindow(title: "TuckSeparator", menuY: 0, candidates: [source, replica])?.key, key(2))
+        // A hidden separator and its replica may both be offscreen.
+        let separator = window(5, CGRect(x: -3266, y: -1440, width: 5016, height: 24), onScreen: false,
+                               title: OwnItem.separator.title)
+        let separatorReplica = window(3, CGRect(x: -3632, y: 0, width: 5016, height: 37), onScreen: false)
+        let own = [control, replica, separator, separatorReplica]
+        func rows(_ windows: [StatusWindow]) -> MenuRows {
+            MenuRows(WindowList(skippingMalformed: windows), ownPID: 42, displays: [])
+        }
+        let anchored = rows(own)
+        XCTAssertNil(anchored.fault)
+        XCTAssertEqual(anchored.rows, [-1440, 0])
+        XCTAssertEqual(anchored.control.map(\.key), [key(1), key(2)])
+        XCTAssertEqual(anchored.separator.map(\.key), [key(5), key(3)])
+        XCTAssertFalse(anchored.boundaryRevealed)
+        // A second same-width window on a row, or a second named source, identifies nothing.
+        XCTAssertEqual(rows(own + [window(4, replica.frame, onScreen: false)]).fault, "ambiguous control anchors")
+        XCTAssertEqual(rows(own + [window(6, control.frame.offsetBy(dx: 0, dy: 500), title: OwnItem.control.title)]).fault,
+                       "Tuck's menu bar items not identified")
+        XCTAssertEqual(rows(own.filter { $0.key != key(1) }).fault, "Tuck's menu bar items not identified")
     }
 
     func testUnknownOffscreenGhostDoesNotBlockSuccessfulEmptyExtras() {
@@ -89,14 +92,14 @@ final class MenuBarTests: XCTestCase {
         XCTAssertFalse(shouldBlockEmptyExtras(candidates: [], hasLastGood: false))
     }
 
-    func testWindowListRejectsDuplicateKeysAndUnusableFrames() throws {
+    func testWindowListDropsDuplicateKeysAndUnusableFrames() {
         let good = window(1, CGRect(x: 10, y: 0, width: 36, height: 24))
         let duplicate = window(1, CGRect(x: 60, y: 0, width: 36, height: 24))
         let empty = window(2, CGRect(x: 10, y: 0, width: 0, height: 24))
         let infinite = window(3, CGRect(x: CGFloat.infinity, y: 0, width: 36, height: 24))
-        XCTAssertEqual(try WindowList([good]).windows, [good])
+        XCTAssertEqual(WindowList(skippingMalformed: [good]).windows, [good])
         for bad in [[good, duplicate], [good, empty], [infinite]] {
-            XCTAssertThrowsError(try WindowList(bad)) { XCTAssertEqual($0 as? WindowList.Fault, .malformed) }
+            XCTAssertEqual(WindowList(skippingMalformed: bad).windows, bad.first == good ? [good] : [])
         }
         XCTAssertEqual(WindowList(skippingMalformed: [good, duplicate, empty, infinite]).windows, [good])
     }

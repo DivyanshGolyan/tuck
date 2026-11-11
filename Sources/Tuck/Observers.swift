@@ -10,7 +10,7 @@ private final class ObserverRelay {
     let incarnation = UUID().uuidString
     let applicationIncarnation: String
     let deliver: @MainActor (pid_t, String, AXUIElement, String) -> Void
-    init(app: AXApplicationContext, deliver: @escaping @MainActor (pid_t, String, AXUIElement, String) -> Void) {
+    init(app: AppProcess, deliver: @escaping @MainActor (pid_t, String, AXUIElement, String) -> Void) {
         pid = app.pid; applicationIncarnation = app.incarnation; self.deliver = deliver
     }
 }
@@ -67,7 +67,7 @@ private final class ObserverReader {
 
     func clear() { registrations.removeAll() }
 
-    func refresh(apps: [AXApplicationContext], pids: Set<pid_t>?, menus: [pid_t: [AXUIElement]],
+    func refresh(apps: [AppProcess], pids: Set<pid_t>?, menus: [pid_t: [AXUIElement]],
                  deliver: @escaping @MainActor (pid_t, String, AXUIElement, String) -> Void) -> ObserverRefresh {
         let live = Dictionary(uniqueKeysWithValues: apps.map { ($0.pid, $0) })
         var retired: [ObserverRegistration] = []
@@ -312,8 +312,8 @@ final class IconObservers {
                 let requested: Set<pid_t>? = self.allRequested ? nil : self.requestedPIDs
                 self.allRequested = false; self.requestedPIDs.removeAll()
                 let apps = NSWorkspace.shared.runningApplications.filter { $0.processIdentifier != getpid() }.map {
-                    AXApplicationContext(pid: $0.processIdentifier, bundle: $0.bundleIdentifier ?? "", name: $0.localizedName ?? "Application",
-                        incarnation: AXApplicationContext.incarnation(pid: $0.processIdentifier, launchDate: $0.launchDate))
+                    AppProcess(pid: $0.processIdentifier, bundle: $0.bundleIdentifier ?? "", name: $0.localizedName ?? "Application",
+                        incarnation: AppProcess.incarnation(pid: $0.processIdentifier, launchDate: $0.launchDate) ?? UUID().uuidString)
                 }
                 let reader = self.reader
                 let menus = Dictionary(grouping: self.ledger.tokens, by: \.pid).mapValues { $0.map(\.element) }

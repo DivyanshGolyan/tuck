@@ -1,6 +1,6 @@
 import CoreGraphics
 import XCTest
-import TuckCore
+@testable import TuckCore
 
 /// Ported from VisibilityLayoutTests with the same fixtures. A valid certificate is now
 /// a reusable bar built from clean readings; "matches" is the observe-only hide finding
@@ -70,7 +70,7 @@ final class MenuBarReplicaTests: XCTestCase {
                                readings: readings(evidence ?? icons(known), in: windows, running: running), previous: .none)
     }
     private func stale(_ bar: MenuBar, _ windows: [StatusWindow], running: [AppProcess]? = nil) -> [Int32: String] {
-        bar.staleApps(in: rows(windows), running: running ?? apps)
+        bar.survey(rows(windows), running: running ?? apps).stale
     }
     /// The observe-only hide as App runs it: nil when it would hide, else why not.
     private func decline(_ bar: MenuBar, _ windows: [StatusWindow], running: [AppProcess]? = nil,
@@ -79,8 +79,9 @@ final class MenuBarReplicaTests: XCTestCase {
         guard bar.reusable else { return "no verified layout" }
         let rows = rows(windows)
         if rows.skippedMalformed { return "invalid window snapshot" }
-        let stale = bar.staleApps(in: rows, running: running)
-        let observed = MenuBar.observe(rows, running: running, readings: [], previous: bar)
+        let survey = bar.survey(rows, running: running)
+        let stale = survey.stale
+        let observed = MenuBar.observe(survey, readings: [])
         XCTAssertEqual(observed.complete, stale.isEmpty && rows.fault == nil, "complete exactly when nothing is stale", file: file, line: line)
         if let fault = rows.fault { return fault }
         if let pid = stale.keys.min() { return stale[pid] }
@@ -406,12 +407,11 @@ final class MenuBarReplicaTests: XCTestCase {
         let mixed = certify(projected, evidence: [icon(replicas(known)[0]), icon(known[1])])
         XCTAssertTrue(mixed.issues.contains(WorkIssue(recovery: .retry, message: "Waiting for a coherent active menu bar")))
         XCTAssertEqual(stale(mixed, projected)[42], "not yet read")
-        // Malformed records: the strict list refuses them, the skipping read drops them
-        // and says so, and the observe-only hide declines.
+        // Malformed records: the read drops them and says so, and the observe-only hide declines.
         let duplicate = projected + [known[0]]
         let nan = replacing(projected, known[0].key, with: window(1, x: .nan))
         for bad in [duplicate, nan] {
-            XCTAssertThrowsError(try WindowList(bad))
+            XCTAssertEqual(WindowList(skippingMalformed: bad).windows.count, bad.count - 1)
             XCTAssertTrue(rows(bad).skippedMalformed)
             XCTAssertEqual(decline(certify(projected), bad), "invalid window snapshot")
         }
@@ -593,13 +593,13 @@ final class MenuBarReplicaTests: XCTestCase {
         XCTAssertFalse(failed.complete)
         XCTAssertEqual(failed.issues, [WorkIssue(recovery: .retry, message: "App 42: AX timeout")])
         XCTAssertEqual(failed.roles.map(\.identity.key), bar.roles.map(\.identity.key))
-        XCTAssertEqual(failed.staleApps(in: rows(projected), running: apps), [42: "previous read incomplete"])
+        XCTAssertEqual(stale(failed, projected), [42: "previous read incomplete"])
         let issue = WorkIssue(recovery: .retry, message: "App 42: ambiguous window match")
         let unclear = MenuBar.observe(rows(projected), running: apps,
                                       readings: [AppReading(app: app(42), outcome: .unclear([], [issue]))], previous: bar)
         XCTAssertEqual(unclear.issues, [issue])
         XCTAssertEqual(unclear.roles.count, 2)
-        XCTAssertEqual(unclear.staleApps(in: rows(projected), running: apps), [42: "previous read incomplete"])
+        XCTAssertEqual(stale(unclear, projected), [42: "previous read incomplete"])
         // Read cleanly again, the app vouches for itself.
         let clean = MenuBar.observe(rows(projected), running: apps,
                                     readings: readings(icons(known), in: projected, running: apps), previous: unclear)
@@ -645,7 +645,7 @@ final class MenuBarReplicaTests: XCTestCase {
         XCTAssertTrue(next.complete, "\(next.issues)")
         XCTAssertEqual(Set(next.roles.map(\.identity.key)), [id(42, 1), id(42, 2), id(43, 3), id(43, 4)])
         XCTAssertTrue(next.reusable)
-        XCTAssertEqual(next.staleApps(in: rows(changed), running: apps), [:])
+        XCTAssertEqual(stale(next, changed), [:])
     }
 
     func testRowsThatDisagreeOnOrderBlockOnlyAnAppNotReadThisPass() {
@@ -663,7 +663,7 @@ final class MenuBarReplicaTests: XCTestCase {
         XCTAssertTrue(read.complete, "\(read.issues)")
         XCTAssertFalse(read.reusable)
         XCTAssertEqual(read.order, [id(42, 1), id(42, 2), OwnItem.separator.id, OwnItem.control.id])
-        XCTAssertNotNil(read.staleApps(in: rows(disagreeing), running: apps)[42])
+        XCTAssertNotNil(stale(read, disagreeing)[42])
     }
 
     func testABarWithNoIconsOfOtherAppsIsNotComplete() {

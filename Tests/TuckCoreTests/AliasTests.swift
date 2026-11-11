@@ -1,5 +1,5 @@
 import XCTest
-import TuckCore
+@testable import TuckCore
 
 final class AliasTests: XCTestCase {
     private func icon(_ bundle: String, _ item: String? = nil) -> IconIdentity { IconIdentity(bundle: bundle, item: item) }

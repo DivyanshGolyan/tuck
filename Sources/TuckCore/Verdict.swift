@@ -6,9 +6,9 @@ import Foundation
 /// Every numeric bound of the middle layer.
 public enum Limits {
     /// Unchanged observations after a posted move before it counts as having had no effect.
-    public static let unchangedReads = 3
+    static let unchangedReads = 3
     /// Strikes on one attempt key before its moves are abandoned.
-    public static let attempts = 2
+    static let attempts = 2
     /// Gather-and-assess iterations one pass may run: a budget of max(4, 2 x managed)
     /// moves, plus the reveal settle and the final observation.
     public static func passSteps(managed: Int) -> Int { max(4, 2 * managed) + 2 }
@@ -151,7 +151,7 @@ public struct Roster: Sendable {
         /// On the reference row, else on the first row the icon has a window on.
         public let frame: CGRect
         let onReference: Bool
-        public var metadata: ItemMetadata {
+        var metadata: ItemMetadata {
             ItemMetadata(bundleID: role.identity.bundle, label: role.label, item: role.identity.item, movable: role.movable)
         }
     }
@@ -244,13 +244,13 @@ public struct Roster: Sendable {
 /// Config ids for observed icons, in observation order. An icon takes the id of the one
 /// config item with its bundle and item; otherwise its identity key, suffixed "#2",
 /// "#3", ... past every id already in use. Icons that end on one id are all dropped.
-public struct Aliases: Equatable, Sendable {
+struct Aliases: Equatable, Sendable {
     /// Per icon; nil for an icon whose id collided with another icon's.
-    public let ids: [String?]
+    let ids: [String?]
     /// Ids more than one icon resolved to, sorted.
-    public let collisions: [String]
+    let collisions: [String]
 
-    public init(_ icons: [IconIdentity], items: [String: ItemMetadata]) {
+    init(_ icons: [IconIdentity], items: [String: ItemMetadata]) {
         var allocated = Set(items.keys)
         let resolved = icons.map { icon -> String in
             let matches = items.filter { $0.value.bundleID == icon.bundle && $0.value.item == icon.item }
@@ -267,7 +267,7 @@ public struct Aliases: Equatable, Sendable {
     }
 
     /// Why the observation cannot be used under this config; nil when every icon has its own id.
-    public var issue: WorkIssue? {
+    var issue: WorkIssue? {
         collisions.isEmpty ? nil : WorkIssue(recovery: .retry,
             message: collisions.map { "Ambiguous config alias: " + $0 }.joined(separator: "; "))
     }
@@ -275,12 +275,12 @@ public struct Aliases: Equatable, Sendable {
 
 // MARK: - Layout analysis
 
-public enum LayoutError: Error, Equatable, CustomStringConvertible {
+enum LayoutError: Error, Equatable, CustomStringConvertible {
     case duplicateID(String)
     case separatorInPlacement
     case missingSeparator
 
-    public var description: String {
+    var description: String {
         switch self {
         case .duplicateID(let id): return "Duplicate layout ID '\(id)'."
         case .separatorInPlacement: return "The separator cannot also be a placed item."
@@ -289,7 +289,7 @@ public enum LayoutError: Error, Equatable, CustomStringConvertible {
     }
 }
 
-public enum Purpose: Equatable, Sendable {
+enum Purpose: Equatable, Sendable {
     /// Removes a leak. Abandoning it blocks hiding.
     case unblockHide
     /// Moves a stray into the hidden group. Abandoning it leaves the icon visible.
@@ -313,12 +313,13 @@ struct AttemptKey: Equatable, Sendable {
     }
 }
 
+/// One planned move. The shell sees only its label; how to perform it is the `Subject`.
 public struct Move: Equatable, Sendable {
-    public let id: String
+    let id: String
     public let label: String
     /// Insert immediately before this id, or at the end when nil.
-    public let before: String?
-    public let purpose: Purpose
+    let before: String?
+    let purpose: Purpose
     let attempt: AttemptKey
 }
 
@@ -328,22 +329,22 @@ public struct Move: Equatable, Sendable {
 public struct Layout: Equatable, Sendable {
     /// The observed order this layout was computed from.
     public let order: [String]
-    public let target: [String]
+    let target: [String]
     /// Visible-group ids (and the control) left of the separator. Hiding is unsafe
     /// while non-empty.
-    public let leaks: [String]
+    let leaks: [String]
     /// Hidden-group ids right of the separator. They merely stay visible.
-    public let strays: [String]
+    let strays: [String]
     /// Moves by purpose, applicable one after another from `order`. Only the first
     /// move of the first non-empty list is ever executed; the shell then replans.
-    public let required: [Move]
-    public let tuck: [Move]
-    public let cosmetic: [Move]
+    let required: [Move]
+    let tuck: [Move]
+    let cosmetic: [Move]
 
-    public var next: Move? { required.first ?? tuck.first ?? cosmetic.first }
+    var next: Move? { required.first ?? tuck.first ?? cosmetic.first }
 
     /// `visible` excludes the control, which always ends the visible group.
-    public init(order: [String], hidden: [String], visible: [String], rows: [CGFloat], displays: [Display] = [],
+    init(order: [String], hidden: [String], visible: [String], rows: [CGFloat], displays: [Display] = [],
                 label: (String) -> String = { $0 }) throws {
         var placed: Set<String> = [OwnItem.control.id]
         for id in hidden + visible {
@@ -558,7 +559,7 @@ public struct MoveHistory: Equatable, Sendable {
     public var pending: Bool { if case .pending = phase { return true }; return false }
 
     /// Fold one observation of the managed order in. `goalMet` means the order equals the target.
-    public func observe(order: [String], goalMet: Bool) -> MoveHistory {
+    func observe(order: [String], goalMet: Bool) -> MoveHistory {
         guard case .pending(let move, let reads) = phase else { return self }
         var next = self
         if goalMet || order != move.attempt.order {
@@ -573,7 +574,7 @@ public struct MoveHistory: Equatable, Sendable {
     }
 
     /// The recorded reason once the move's attempt key has `Limits.attempts` strikes.
-    public func abandoned(_ move: Move) -> String? { abandoned(move.attempt) }
+    func abandoned(_ move: Move) -> String? { abandoned(move.attempt) }
 
     func abandoned(_ key: AttemptKey) -> String? {
         guard let strikes, strikes.key == key, strikes.count >= Limits.attempts else { return nil }

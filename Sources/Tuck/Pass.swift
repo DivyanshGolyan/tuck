@@ -13,6 +13,8 @@ protocol PassHost: AnyObject {
     func willApply()
     /// A menu is open or input is held; wake the scheduler when it ends.
     func waitForInput()
+    /// An audit changed the bar. A disagreement wants another pass.
+    func audited(disagreed: Bool)
 }
 
 /// Diagnostics written to runtime.json under the existing field names.
@@ -43,6 +45,7 @@ final class Reconciler {
     private weak var host: PassHost?
     private let windows = SerialWorker(label: "local.tuck.visibility")
     private let reader = AppReader()
+    private let processes = RunningApps()
 
     private(set) var bar = MenuBar.none
     private(set) var history = MoveHistory()
@@ -50,6 +53,11 @@ final class Reconciler {
     /// Counts pending moves whose outcome an observation settled.
     private(set) var resolvedMoves = 0
     private var observerTargets: Set<pid_t> = []
+    /// Gathers started, in either reach, and those still running. An audit starts only
+    /// between gathers and is discarded when one started during its read.
+    private var gathers = 0, gathering = 0
+    /// Set by a disagreeing audit so the pass it requests does not audit in turn.
+    private var auditHeld = false
 
     init(separator: NSStatusItem, control: NSStatusItem, mover: Mover, observers: IconObservers,
          store: ConfigStore, files: SerialWorker, host: PassHost) {
@@ -142,6 +150,7 @@ final class Reconciler {
                 stats.reconciles += 1
                 stats.reconcilePhases = phases
                 stats.reconcileMS = phases.values.reduce(0, +)
+                if auditHeld { auditHeld = false } else { Task { [weak self] in await self?.audit() } }
                 return .applied(note: note)
             case .stop(let issue):
                 throw DeferredWork(issue: issue)
@@ -166,10 +175,13 @@ final class Reconciler {
     /// none in observe-only reach.
     private func gather(_ reach: Gather.Reach, guardrail: () throws -> Void, lap: (String) -> Void) async throws -> MenuBar {
         let started = DispatchTime.now().uptimeNanoseconds
+        gathers += 1
+        gathering += 1
+        defer { gathering -= 1 }
         let rows = try await Gather.rows(on: windows)
         try guardrail()
         lap("windows")
-        bar = try await Gather.bar(rows, previous: bar, reach: reach, reader: reader, check: guardrail)
+        bar = try await Gather.bar(rows, previous: bar, running: processes.current(), reach: reach, reader: reader, check: guardrail)
         lap("apps")
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
         if reach == .full { stats.scans += 1; stats.scanMS = elapsed } else { stats.visibilityCheckMS = elapsed }
@@ -196,6 +208,23 @@ final class Reconciler {
         } catch let failure as MovementFailure where !posted && failure.recovery == .awaitChange {
             history = history.record(.refused(move, reason: failure.message, permanent: true))
         }
+    }
+
+    /// Re-reads one carried app after a full pass applied and folds the reading back in
+    /// (`MenuBar.observe` treats it as an audit), so a binding that stopped matching AX
+    /// is caught even while its windows stay unchanged. Skipped while a menu is open,
+    /// input is held or the session is locked, and while a gather runs; discarded when a
+    /// gather started during the read, because that gather owns `bar`.
+    private func audit() async {
+        guard gathering == 0, let app = bar.auditTarget, !observers.isMenuOpen, !mover.userIsBusy else { return }
+        let seen = gathers, rows = bar.rows, hadIcons = Set(bar.roles.map(\.pid)), reader = self.reader
+        guard let readings = try? await SerialWorker.system.run({ reader.read([app], rows: rows, hadIcons: hadIcons) }),
+              gathers == seen else { return }
+        let before = bar
+        bar = MenuBar.observe(before.survey(rows, running: processes.current()), readings: readings)
+        let disagreed = bar.auditMismatches > before.auditMismatches
+        if disagreed { auditHeld = true }
+        if disagreed || bar.reusable != before.reusable { host?.audited(disagreed: disagreed) }
     }
 
     private func placeOwnedItem(_ item: NSStatusItem, shift: CGFloat, began: () -> Void) async throws {
@@ -240,14 +269,38 @@ final class Reconciler {
     }
 }
 
-extension AppProcess {
-    /// Running apps with a bundle id, excluding Tuck.
-    @MainActor static func running() -> [AppProcess] {
-        NSWorkspace.shared.runningApplications.compactMap { app in
-            guard app.processIdentifier != getpid(), let bundle = app.bundleIdentifier, bundle != "local.tuck" else { return nil }
-            return AppProcess(pid: app.processIdentifier, bundle: bundle, name: app.localizedName ?? bundle,
-                              incarnation: incarnation(pid: app.processIdentifier, launchDate: app.launchDate))
+/// Running apps with a bundle id, excluding Tuck. NSWorkspace keeps one
+/// NSRunningApplication per process, and a process keeps its pid, bundle and
+/// incarnation for life, so each instance is read once and forgotten when it leaves the
+/// list. Holding the instance keeps its identifier from being reused meanwhile. A
+/// process with no knowable incarnation gets a new one on every read, as it always has.
+@MainActor
+final class RunningApps {
+    private enum Entry { case excluded, process(AppProcess) }
+    private var known: [ObjectIdentifier: (instance: NSRunningApplication, entry: Entry)] = [:]
+
+    func current() -> [AppProcess] {
+        let own = getpid()
+        var next: [ObjectIdentifier: (instance: NSRunningApplication, entry: Entry)] = [:]
+        let processes = NSWorkspace.shared.runningApplications.compactMap { instance -> AppProcess? in
+            let id = ObjectIdentifier(instance)
+            if let entry = known[id]?.entry {
+                next[id] = (instance, entry)
+                if case .process(let process) = entry { return process }
+                return nil
+            }
+            guard instance.processIdentifier != own, let bundle = instance.bundleIdentifier, bundle != "local.tuck" else {
+                next[id] = (instance, .excluded)
+                return nil
+            }
+            let incarnation = AppProcess.incarnation(pid: instance.processIdentifier, launchDate: instance.launchDate)
+            let process = AppProcess(pid: instance.processIdentifier, bundle: bundle, name: instance.localizedName ?? bundle,
+                                     incarnation: incarnation ?? UUID().uuidString)
+            if incarnation != nil { next[id] = (instance, .process(process)) }
+            return process
         }
+        known = next
+        return processes
     }
 }
 
@@ -278,7 +331,7 @@ enum Gather {
     static func rows(on worker: SerialWorker, adding extra: [StatusWindow] = []) async throws -> MenuRows {
         let displays = Display.current()
         let read: (list: WindowList, malformed: Bool)
-        do { read = try await worker.run { try WindowList.readSkippingMalformed() } }
+        do { read = try await worker.run { try WindowList.read() } }
         catch is CancellationError { throw CancellationError() }
         catch { throw AXReadFailure("Window inventory temporarily unavailable") }
         let list = extra.isEmpty ? read.list : WindowList(skippingMalformed: read.list.windows + extra)
@@ -286,40 +339,29 @@ enum Gather {
     }
 
     /// `check` runs after the AX read and throws to abandon the observation.
-    static func bar(_ rows: MenuRows, previous: MenuBar, reach: Reach, reader: AppReader,
+    static func bar(_ rows: MenuRows, previous: MenuBar, running: [AppProcess], reach: Reach, reader: AppReader,
                     check: () throws -> Void = {}) async throws -> MenuBar {
-        let running = AppProcess.running()
+        let survey = previous.survey(rows, running: running)
         var readings: [AppReading] = []
         // Faulty rows can bind nothing; the bar is incomplete either way.
-        if reach == .full && rows.fault == nil {
-            let stale = previous.staleApps(in: rows, running: running)
-            if !stale.isEmpty {
-                let targets = running.filter { stale[$0.pid] != nil }
-                let hadIcons = Set(previous.roles.map(\.pid))
-                readings = try await SerialWorker.system.run { reader.read(targets, rows: rows, hadIcons: hadIcons) }
-                try check()
-            }
+        if reach == .full && rows.fault == nil && !survey.stale.isEmpty {
+            let targets = running.filter { survey.stale[$0.pid] != nil }
+            let hadIcons = Set(previous.roles.map(\.pid))
+            readings = try await SerialWorker.system.run { reader.read(targets, rows: rows, hadIcons: hadIcons) }
+            try check()
         }
-        return MenuBar.observe(rows, running: running, readings: readings, previous: previous)
+        return MenuBar.observe(survey, readings: readings)
     }
 }
 
 // MARK: - The single window-list parser
 
 extension WindowList {
-    /// Every status-layer window (no height or display filter). Throws `.unavailable`
-    /// when CG returns no list and `.malformed` when a status record lacks pid,
-    /// number or usable bounds, or repeats a key.
-    nonisolated static func read() throws -> WindowList {
-        let (windows, complete) = parse(try copyAll())
-        guard complete else { throw Fault.malformed }
-        return try WindowList(windows)
-    }
-
-    /// The same read, keeping only well-formed windows and reporting whether any
-    /// status record was dropped. A single bad record must not stop the full pass,
-    /// AppReader or Mover; the observe-only hide declines on it.
-    nonisolated static func readSkippingMalformed() throws -> (list: WindowList, malformed: Bool) {
+    /// Every well-formed status-layer window (no height or display filter), and whether
+    /// any status record lacked pid, number or usable bounds, or repeated a key. Throws
+    /// `.unavailable` when CG returns no list. A single bad record must not stop the full
+    /// pass or AppReader; the observe-only hide declines on it.
+    nonisolated static func read() throws -> (list: WindowList, malformed: Bool) {
         let (windows, complete) = parse(try copyAll())
         let list = WindowList(skippingMalformed: windows)
         return (list, !complete || list.windows.count != windows.count)

@@ -27,9 +27,9 @@ public enum ConfigStoreError: Error, CustomStringConvertible {
 /// An external editor may change the on-disk file after this snapshot is captured.
 public struct ConfigSnapshot: Equatable, Sendable {
     public let config: TuckConfig
-    public let bytes: Data
+    let bytes: Data
 
-    public init(config: TuckConfig, bytes: Data) {
+    init(config: TuckConfig, bytes: Data) {
         self.config = config
         self.bytes = bytes
     }
@@ -41,12 +41,12 @@ public struct ConfigSnapshot: Equatable, Sendable {
 /// races, but there remains an unavoidable check-to-rename window.
 public final class ConfigStore {
     public static let maximumBytes = 1_048_576
-    public let url: URL
+    let url: URL
 
     public init(url: URL) { self.url = url }
 
     /// Creates a default configuration only when no file exists.
-    public func load() throws -> TuckConfig {
+    func load() throws -> TuckConfig {
         try loadSnapshot().config
     }
 
@@ -58,7 +58,7 @@ public final class ConfigStore {
     /// Re-reads under the lock and merges only unknown IDs. Invalid existing files
     /// are never replaced. Known-only discoveries cause no write whatsoever.
     @discardableResult
-    public func register(_ discovered: [String: ItemMetadata], orderedIDs: [String]? = nil, preserveObservedPositions: Bool = false) throws -> TuckConfig {
+    func register(_ discovered: [String: ItemMetadata], orderedIDs: [String]? = nil, preserveObservedPositions: Bool = false) throws -> TuckConfig {
         try registerSnapshot(discovered, orderedIDs: orderedIDs, preserveObservedPositions: preserveObservedPositions).config
     }
 

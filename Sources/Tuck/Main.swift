@@ -41,7 +41,8 @@ struct TuckMain {
                 do {
                     let rows = try await Gather.rows(on: SerialWorker(label: "local.tuck.inventory"),
                                                      adding: standInAnchors(Display.current()))
-                    let bar = try await Gather.bar(rows, previous: .none, reach: .full, reader: AppReader())
+                    let bar = try await Gather.bar(rows, previous: .none, running: RunningApps().current(),
+                                                   reach: .full, reader: AppReader())
                     let issues = bar.rows.fault.map { [WorkIssue(recovery: .retry, message: $0)] } ?? bar.issues
                     let counts = Dictionary(bar.roles.map { ($0.identity, 1) }, uniquingKeysWith: +)
                     let icons = bar.roles.filter { counts[$0.identity] == 1 }.compactMap { role -> [String: Any]? in

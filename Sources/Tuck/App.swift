@@ -371,6 +371,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, PassHost {
         }
     }
 
+    func audited(disagreed: Bool) {
+        writeRuntime()
+        if disagreed { request() }
+    }
+
     private func scheduleRetry(_ issue: WorkIssue) {
         waiting = issue.message; lastError = nil; phase = "waiting"
         gate.deferPending()
@@ -413,7 +418,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, PassHost {
                 // Revealing our own boundary is safe without another process's
                 // geometry. Busy providers must not unnecessarily delay access.
                 if self.showHidden { self.separator.length = 4 }
-                self.accessibility = try await SerialWorker.system.run { AXIsProcessTrusted() }
+                // Not on SerialWorker.system: a post-pass audit's AX read may hold it, and
+                // a pass that needs no AX must not wait behind one.
+                self.accessibility = AXIsProcessTrusted()
                 try self.check(token)
                 guard self.accessibility else {
                     self.separator.length = 4
@@ -514,7 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, PassHost {
             "scanMS": stats.scanMS, "configLoadMS": lastConfigLoadMS,
             "visibilityCheckMS": stats.visibilityCheckMS, "fastHides": stats.fastHides,
             "fastHideReason": stats.fastHideReason as Any? ?? NSNull(),
-            "verifiedLayout": bar.reusable,
+            "verifiedLayout": bar.reusable, "auditMismatches": bar.auditMismatches,
             "icons": roster.icons.map { ["id": $0.id, "label": $0.role.label, "movable": $0.role.movable, "x": $0.frame.minX] as [String: Any] },
             "hiddenIDs": config?.hidden ?? [], "revision": desiredRevision,
             "appliedRevision": appliedRevision as Any? ?? NSNull(), "workGeneration": gate.generation,

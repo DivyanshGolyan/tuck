@@ -1,7 +1,7 @@
 import ApplicationServices
 import Foundation
 import XCTest
-import TuckCore
+@testable import TuckCore
 @testable import Tuck
 
 final class AXReadTests: XCTestCase {
@@ -11,11 +11,11 @@ final class AXReadTests: XCTestCase {
 
     func testIncarnationIsStableForARunningProcessWithoutLaunchDate() {
         let own = getpid()
-        let first = AXApplicationContext.incarnation(pid: own, launchDate: nil)
-        XCTAssertEqual(first, AXApplicationContext.incarnation(pid: own, launchDate: nil))
-        XCTAssertNotEqual(first, AXApplicationContext.incarnation(pid: 1, launchDate: nil))
+        let first = AppProcess.incarnation(pid: own, launchDate: nil)
+        XCTAssertEqual(first, AppProcess.incarnation(pid: own, launchDate: nil))
+        XCTAssertNotEqual(first, AppProcess.incarnation(pid: 1, launchDate: nil))
         let date = Date(timeIntervalSince1970: 1_700_000_000)
-        XCTAssertEqual(AXApplicationContext.incarnation(pid: own, launchDate: date), String(date.timeIntervalSince1970))
+        XCTAssertEqual(AppProcess.incarnation(pid: own, launchDate: date), String(date.timeIntervalSince1970))
     }
 
     func testTypedRecoveryClassification() {
@@ -132,18 +132,19 @@ final class AXReadTests: XCTestCase {
         let rows = MenuRows(list, ownPID: own, displays: [])
         let cached = AppReading.BoundIcon(identity: IconIdentity(bundle: app.bundle, item: "cached"), label: "Cached",
                                           movable: true, window: icon.key, element: 0)
-        let clean = MenuBar.observe(rows, running: [app], readings: [AppReading(app: app, outcome: .clean([cached]))], previous: .none)
+        let clean = MenuBar.observe(MenuBar.none.survey(rows, running: [app]),
+                                    readings: [AppReading(app: app, outcome: .clean([cached]))])
         XCTAssertTrue(clean.complete)
         XCTAssertTrue(clean.reusable)
 
-        let busy = MenuBar.observe(rows, running: [app], readings: [.failed(app, WorkIssue(recovery: .retry, message: "Target busy"))],
-                                   previous: clean)
+        let busy = MenuBar.observe(clean.survey(rows, running: [app]),
+                                   readings: [.failed(app, WorkIssue(recovery: .retry, message: "Target busy"))])
         XCTAssertEqual(busy.roles.map(\.identity.key), ["local.test::cached"])
         XCTAssertFalse(busy.complete)
         XCTAssertFalse(busy.reusable)
-        XCTAssertEqual(busy.staleApps(in: rows, running: [app]), [app.pid: "previous read incomplete"])
+        XCTAssertEqual(busy.survey(rows, running: [app]).stale, [app.pid: "previous read incomplete"])
 
-        let unread = MenuBar.observe(rows, running: [app], readings: [], previous: busy)
+        let unread = MenuBar.observe(busy.survey(rows, running: [app]), readings: [])
         XCTAssertEqual(unread.roles.map(\.identity.key), ["local.test::cached"])
         XCTAssertFalse(unread.complete)
         XCTAssertEqual(unread.issues, [WorkIssue(recovery: .retry, message: "Test: not read (previous read incomplete)")])

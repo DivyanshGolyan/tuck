@@ -1,13 +1,13 @@
 import Foundation
 
 public struct ItemMetadata: Codable, Equatable, Sendable {
-    public var bundleID: String
-    public var label: String
-    public var item: String?
+    var bundleID: String
+    var label: String
+    var item: String?
     /// Descriptive adapter information, not a user override of platform constraints.
-    public var movable: Bool?
+    var movable: Bool?
 
-    public init(bundleID: String, label: String, item: String? = nil, movable: Bool? = nil) {
+    init(bundleID: String, label: String, item: String? = nil, movable: Bool? = nil) {
         self.bundleID = bundleID
         self.label = label
         self.item = item
@@ -15,7 +15,7 @@ public struct ItemMetadata: Codable, Equatable, Sendable {
     }
 }
 
-public enum ConfigurationError: Error, Equatable, CustomStringConvertible {
+enum ConfigurationError: Error, Equatable, CustomStringConvertible {
     case unsupportedVersion(Int)
     case duplicatePlacement(String)
     case unknownItem(String)
@@ -25,7 +25,7 @@ public enum ConfigurationError: Error, Equatable, CustomStringConvertible {
     case duplicateSelector(String, String)
     case emptyID
 
-    public var description: String {
+    var description: String {
         switch self {
         case .unsupportedVersion(let version): return "Unsupported configuration version \(version); expected 1."
         case .duplicatePlacement(let id): return "Item '\(id)' appears more than once in visible/hidden."
@@ -40,13 +40,13 @@ public enum ConfigurationError: Error, Equatable, CustomStringConvertible {
 }
 
 public struct TuckConfig: Codable, Equatable, Sendable {
-    public var version: Int
+    var version: Int
     public var visible: [String]
     public var hidden: [String]
     public var items: [String: ItemMetadata]
     public var showHidden: Bool
 
-    public init(version: Int = 1, visible: [String] = [], hidden: [String] = [], items: [String: ItemMetadata] = [:], showHidden: Bool = false) {
+    init(version: Int = 1, visible: [String] = [], hidden: [String] = [], items: [String: ItemMetadata] = [:], showHidden: Bool = false) {
         self.version = version
         self.visible = visible
         self.hidden = hidden
@@ -96,7 +96,7 @@ public struct TuckConfig: Codable, Equatable, Sendable {
     /// already in visible; hidden items are never anchors. Unobserved IDs append.
     /// The caller must exclude ambiguous discoveries.
     @discardableResult
-    public mutating func register(_ discovered: [String: ItemMetadata], orderedIDs: [String]? = nil, preserveObservedPositions: Bool = false) throws -> Bool {
+    mutating func register(_ discovered: [String: ItemMetadata], orderedIDs: [String]? = nil, preserveObservedPositions: Bool = false) throws -> Bool {
         try validate()
         let unknown = Set(discovered.keys.filter { items[$0] == nil })
         var appended = Set<String>()
