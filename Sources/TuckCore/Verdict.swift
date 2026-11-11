@@ -13,6 +13,40 @@ public enum Limits {
     public static func passSteps(managed: Int) -> Int { max(4, 2 * managed) }
 }
 
+// MARK: - Config ids
+
+/// Config ids for observed icons, in observation order. An icon takes the id of the one
+/// config item with its bundle and item; otherwise its identity key, suffixed "#2",
+/// "#3", ... past every id already in use. Icons that end on one id are all dropped.
+public struct Aliases: Equatable, Sendable {
+    /// Per icon; nil for an icon whose id collided with another icon's.
+    public let ids: [String?]
+    /// Ids more than one icon resolved to, sorted.
+    public let collisions: [String]
+
+    public init(_ icons: [IconIdentity], items: [String: ItemMetadata]) {
+        var allocated = Set(items.keys)
+        let resolved = icons.map { icon -> String in
+            let matches = items.filter { $0.value.bundleID == icon.bundle && $0.value.item == icon.item }
+            if matches.count == 1 { return matches.first!.key }
+            var candidate = icon.key
+            var suffix = 2
+            while allocated.contains(candidate) { candidate = icon.key + "#" + String(suffix); suffix += 1 }
+            allocated.insert(candidate)
+            return candidate
+        }
+        let counts = Dictionary(resolved.map { ($0, 1) }, uniquingKeysWith: +)
+        ids = resolved.map { counts[$0] == 1 ? $0 : nil }
+        collisions = counts.filter { $0.value > 1 }.keys.sorted()
+    }
+
+    /// Why the observation cannot be used under this config; nil when every icon has its own id.
+    public var issue: WorkIssue? {
+        collisions.isEmpty ? nil : WorkIssue(recovery: .retry,
+            message: collisions.map { "Ambiguous config alias: " + $0 }.joined(separator: "; "))
+    }
+}
+
 // MARK: - Layout analysis
 
 public enum LayoutError: Error, Equatable, CustomStringConvertible {

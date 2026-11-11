@@ -2,6 +2,25 @@ import AppKit
 import ApplicationServices
 import TuckCore
 
+/// One icon as Mover takes it. All coordinates are CoreGraphics global display coordinates.
+struct BarIcon: Sendable {
+    let id: String
+    let metadata: ItemMetadata
+    let pid: pid_t
+    let windowID: CGWindowID
+    let frame: CGRect
+    let movable: Bool
+}
+
+extension NSScreen {
+    /// Every attached display, in CoreGraphics global coordinates.
+    static var displayBounds: [CGRect] {
+        screens.compactMap { screen in
+            (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { CGDisplayBounds($0.uint32Value) }
+        }
+    }
+}
+
 struct MovementFailure: LocalizedError {
     let message: String
     var recovery: Recovery = .awaitChange

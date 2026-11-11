@@ -156,6 +156,18 @@ public struct MenuRows: Sendable {
 
     /// Every status window of one process: on anchored rows, dormant, or outside.
     func windows(of pid: Int32) -> [StatusWindow] { list.windows.filter { $0.key.pid == pid } }
+
+    /// A menu-height window on an anchored row: one that can be an icon.
+    public func onBar(_ window: StatusWindow) -> Bool {
+        menuHeights.contains(window.frame.height) && row(of: window) != nil
+    }
+
+    /// One process's windows that can be icons.
+    public func barWindows(of pid: Int32) -> [StatusWindow] { windows(of: pid).filter(onBar) }
+
+    /// Whether an AX frame lies near an anchored row. AX reports frames only on the
+    /// active row; a frame anywhere else describes no bar this list knows.
+    public func admits(_ axFrame: CGRect) -> Bool { rows.contains { abs(axFrame.minY - $0) < 64 } }
 }
 
 // MARK: - Processes and AX readings
@@ -232,14 +244,10 @@ public struct AppReading: Sendable {
                             titles: [WindowKey: String], rows: MenuRows, hadIcons: Bool,
                             finalAttempt: Bool) -> AppReading? {
         let name = app.name
-        guard elements.allSatisfy({ element in
-            element.frame.map { frame in rows.rows.contains { abs(frame.minY - $0) < 64 } } ?? true
-        }) else {
+        guard elements.allSatisfy({ element in element.frame.map(rows.admits) ?? true }) else {
             return failed(app, WorkIssue(recovery: .retry, message: "Accessibility geometry is outside current menu rows"))
         }
-        let candidates = windows.filter {
-            $0.key.pid == app.pid && menuHeights.contains($0.frame.height) && rows.row(of: $0) != nil
-        }
+        let candidates = windows.filter { $0.key.pid == app.pid && rows.onBar($0) }
         var used = Set<WindowKey>()
         var matches: [StatusWindow?] = []
         for element in elements {
@@ -426,12 +434,18 @@ public struct MenuBar: Sendable {
 
     public var complete: Bool { issues.isEmpty && rows.fault == nil }
 
+    /// The row positions are read from: `activeRow`, else the first. nil when the rows are faulty.
+    public var referenceRow: Int? {
+        guard rows.fault == nil, !rows.rows.isEmpty else { return nil }
+        return activeRow.flatMap { $0 < rows.rows.count ? $0 : nil } ?? 0
+    }
+
     /// Movable icons' identity keys and Tuck's own ids, left to right on the reference
-    /// row (`activeRow`, else the first). Empty when the rows are faulty.
+    /// row. Empty when the rows are faulty. An ungrouped icon counts by its window on
+    /// that row: in a complete bar it was read on that row this pass.
     public var order: [String] {
-        guard rows.fault == nil, !rows.rows.isEmpty else { return [] }
-        let row = activeRow.flatMap { $0 < rows.rows.count ? $0 : nil } ?? 0
-        let icons = roles.filter { $0.grouped && $0.movable }.compactMap { role in
+        guard let row = referenceRow else { return [] }
+        let icons = roles.filter(\.movable).compactMap { role in
             frame(of: role, row: row).map { (role.identity.key, $0.minX) }
         }
         let own = [(OwnItem.separator.id, rows.separator[row].frame.minX), (OwnItem.control.id, rows.control[row].frame.minX)]
@@ -445,8 +459,8 @@ public struct MenuBar: Sendable {
     }
 
     /// The "nothing changed" question every pass asks. An app needs an AX read iff it
-    /// has status windows and no binding, its incarnation changed, its last reading was
-    /// not clean, its `AppEvidence` changed, one of its roles is ungrouped or lost a
+    /// has a window that can be an icon and no binding, its incarnation changed, its
+    /// last reading was not clean, its `AppEvidence` changed, one of its roles is ungrouped or lost a
     /// replica or its row set, a same-pid window overlays a member, it shows a window on
     /// an anchored row that is no role, its identity is duplicated, or its icons are in a
     /// different order on some row. Returns pid -> human reason.
@@ -456,7 +470,8 @@ public struct MenuBar: Sendable {
 
     /// Build this pass's bar. `readings` should cover every app `staleApps` named; any it
     /// does not cover becomes an issue, never a guess. With no readings the bar is
-    /// complete exactly when `staleApps` is empty and the rows have no fault.
+    /// complete exactly when `staleApps` is empty, the rows have no fault and some icon
+    /// of another app is on the bar.
     public static func observe(_ rows: MenuRows, running: [AppProcess], readings: [AppReading],
                                previous: MenuBar) -> MenuBar {
         let live = Dictionary(running.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
@@ -507,8 +522,16 @@ public struct MenuBar: Sendable {
         }
 
         let after = survey(rows, running: running, bindings: bindings)
-        if after.disordered { issues.append(WorkIssue(recovery: .retry, message: "known window order changed")) }
+        // Rows that disagree on managed order leave the bar unreusable (the apps stay
+        // stale). They block it only when an app involved was not read on the active
+        // row this pass, so its position there is not fresh evidence.
+        if !after.disordered.isSubset(of: fresh.keys) {
+            issues.append(WorkIssue(recovery: .retry, message: "known window order changed"))
+        }
         for key in after.duplicates { issues.append(WorkIssue(recovery: .awaitChange, message: "\(key): ambiguous identity")) }
+        if issues.isEmpty && rows.fault == nil && after.roles.isEmpty {
+            issues.append(WorkIssue(recovery: .retry, message: "Waiting for a coherent active menu bar"))
+        }
         var seen = Set<String>()
         issues = issues.filter { seen.insert($0.message).inserted }
             .sorted { ($0.message, $0.recovery.rawValue) < ($1.message, $1.recovery.rawValue) }
@@ -528,7 +551,9 @@ public struct MenuBar: Sendable {
     private struct Survey {
         var roles: [Role] = []
         var stale: [Int32: String] = [:]
-        var disordered = false
+        /// Processes with an icon in a different managed order on some row; Tuck's own
+        /// pid when its items are.
+        var disordered = Set<Int32>()
         var duplicates: [String] = []
         mutating func mark(_ pid: Int32, _ reason: String) { if stale[pid] == nil { stale[pid] = reason } }
     }
@@ -538,11 +563,13 @@ public struct MenuBar: Sendable {
     private static func survey(_ rows: MenuRows, running: [AppProcess], bindings: [Int32: Binding]) -> Survey {
         var survey = Survey()
         let live = Dictionary(running.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
-        let present = Set(rows.list.windows.map(\.key.pid))
+        // An app with only panels or dormant windows has no icon to read; it is asked
+        // about once one of its windows can be an icon.
+        let onBar = Set(rows.list.windows.filter(rows.onBar).map(\.key.pid))
         for pid in bindings.keys.sorted() where live[pid].map({ $0.incarnation != bindings[pid]!.evidence.incarnation }) == true {
             survey.mark(pid, "process restarted")
         }
-        for app in running where app.pid != rows.ownPID && bindings[app.pid] == nil && present.contains(app.pid) {
+        for app in running where app.pid != rows.ownPID && bindings[app.pid] == nil && onBar.contains(app.pid) {
             survey.mark(app.pid, "not yet read")
         }
 
@@ -609,8 +636,10 @@ public struct MenuBar: Sendable {
                 for j in sequence.indices where j > i {
                     let a = sequence[i], b = sequence[j]
                     guard !(a.x < b.x) || rank[a.id]! > rank[b.id]! else { continue }
-                    survey.disordered = true
-                    for pid in [a.pid, b.pid].compactMap({ $0 }) { survey.mark(pid, "known window order changed") }
+                    for pid in [a.pid, b.pid] {
+                        survey.disordered.insert(pid ?? rows.ownPID)
+                        if let pid { survey.mark(pid, "known window order changed") }
+                    }
                 }
             }
         }

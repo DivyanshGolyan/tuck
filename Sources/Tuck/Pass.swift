@@ -23,6 +23,48 @@ extension Display {
     }
 }
 
+// MARK: - Gather
+
+/// One observation of the menu bar: one full window-list read, then AX only for the
+/// apps the previous bar cannot vouch for.
+@MainActor
+enum Gather {
+    enum Reach {
+        /// Reads no app: the bar is complete exactly when nothing is stale.
+        case observeOnly
+        case full
+    }
+
+    /// The one full window-list read. Malformed records are dropped and `skippedMalformed` says so.
+    static func rows(on worker: SerialWorker, adding extra: [StatusWindow] = []) async throws -> MenuRows {
+        let displays = Display.current()
+        let read: (list: WindowList, malformed: Bool)
+        do { read = try await worker.run { try WindowList.readSkippingMalformed() } }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw AXReadFailure("Window inventory temporarily unavailable") }
+        let list = extra.isEmpty ? read.list : WindowList(skippingMalformed: read.list.windows + extra)
+        return MenuRows(list, ownPID: getpid(), displays: displays, skippedMalformed: read.malformed)
+    }
+
+    /// `check` runs after the AX read and throws to abandon the observation.
+    static func bar(_ rows: MenuRows, previous: MenuBar, reach: Reach, reader: AppReader,
+                    check: () throws -> Void = {}) async throws -> MenuBar {
+        let running = AppProcess.running()
+        var readings: [AppReading] = []
+        // Faulty rows can bind nothing; the bar is incomplete either way.
+        if reach == .full && rows.fault == nil {
+            let stale = previous.staleApps(in: rows, running: running)
+            if !stale.isEmpty {
+                let targets = running.filter { stale[$0.pid] != nil }
+                let hadIcons = Set(previous.roles.map(\.pid))
+                readings = try await SerialWorker.system.run { reader.read(targets, rows: rows, hadIcons: hadIcons) }
+                try check()
+            }
+        }
+        return MenuBar.observe(rows, running: running, readings: readings, previous: previous)
+    }
+}
+
 // MARK: - The single window-list parser
 
 extension WindowList {
@@ -36,8 +78,8 @@ extension WindowList {
     }
 
     /// The same read, keeping only well-formed windows and reporting whether any
-    /// status record was dropped. Inventory, own items and Mover skipped such records
-    /// before; a single bad record must not stop them.
+    /// status record was dropped. A single bad record must not stop the full pass,
+    /// AppReader or Mover; the observe-only hide declines on it.
     nonisolated static func readSkippingMalformed() throws -> (list: WindowList, malformed: Bool) {
         let (windows, complete) = parse(try copyAll())
         let list = WindowList(skippingMalformed: windows)

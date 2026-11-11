@@ -20,7 +20,7 @@ private struct ClickTrace {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let inventory = Inventory()
+    private let reader = AppReader()
     private let mover = Mover()
     private let observers = IconObservers()
     private let files = SerialWorker(label: "local.tuck.files")
@@ -34,9 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watcher: ConfigWatcher?
     private var control: NSStatusItem!
     private var separator: NSStatusItem!
-    private var ownFrames: [String: BarIcon] = [:]
-    private var observationY: CGFloat?
     private var bar = MenuBar.none
+    /// The managed order the last completed pass left under the current placement. Only
+    /// that order is known to have no visible-group icon left of the separator.
+    private var verifiedOrder: [String]?
     private var fastHides = 0
     private var fastHideReason: String?
     private var lastScanMS: Double = 0
@@ -45,7 +46,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastReconcileMS: Double = 0
     private var reconciles = 0
     private var reconcilePhases: [String: Double] = [:]
-    private var snapshot = InventorySnapshot(icons: [], ambiguous: [])
     private var gate = LatestWork()
     private var backoff = RetryBackoff()
     private var work: Task<Void, Never>?
@@ -208,7 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 var previousPlacement = config
                 previousPlacement?.showHidden = loaded.config.showHidden
                 let visibilityOnly = previousPlacement == loaded.config
-                if !visibilityOnly { bar = .none }
+                if !visibilityOnly { verifiedOrder = nil }
                 config = loaded.config
                 desiredRevision += 1
                 backoff.reset()
@@ -231,37 +231,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// A visibility-only edit doesn't require rediscovering every AX provider.
-    /// One window-list read: if the carried bar still vouches for every app and the
-    /// managed order is the one the last full pass verified, hide; otherwise the
-    /// normal pass does the work.
+    /// The full pass's gather with no AX: if the carried bar still vouches for every app
+    /// and the managed order is the one the last completed pass left, hide; otherwise
+    /// the normal pass does the work. The observation is not kept.
     private func hideVerifiedLayout(request: Int) async {
-        guard bar.reusable else { fastHideReason = "no verified layout"; return }
+        guard bar.reusable, let verifiedOrder else { fastHideReason = "no verified layout"; return }
         guard !history.pending else { fastHideReason = "move outcome unknown"; return }
         guard accessibility else { fastHideReason = "permission not verified"; return }
         guard !observers.isMenuOpen, !mover.userIsBusy else { fastHideReason = "input or menu before check"; return }
         let generation = gate.generation
         let started = DispatchTime.now().uptimeNanoseconds
-        guard let read = try? await geometry.run({ try WindowList.readSkippingMalformed() }) else { fastHideReason = "window read failed"; return }
+        guard let rows = try? await Gather.rows(on: geometry),
+              let observed = try? await Gather.bar(rows, previous: bar, reach: .observeOnly, reader: reader) else {
+            fastHideReason = "window read failed"; return
+        }
         lastVisibilityCheckMS = elapsedMS(since: started)
         guard request == configRequest else { fastHideReason = "config changed during check"; return }
         guard generation == gate.generation else { fastHideReason = "work generation changed during check"; return }
         guard !terminating, !showHidden, !Mover.sessionIsLocked else { fastHideReason = "intent, lock or termination changed"; return }
         guard !history.pending, !observers.isMenuOpen, !mover.userIsBusy else { fastHideReason = "input, menu or move during check"; return }
-        let rows = MenuRows(read.list, ownPID: getpid(), displays: Display.current(), skippedMalformed: read.malformed)
         guard !rows.skippedMalformed else { fastHideReason = "invalid window snapshot"; return }
-        let running = AppProcess.running()
-        let observed = MenuBar.observe(rows, running: running, readings: [], previous: bar)
         guard observed.complete else {
+            let running = AppProcess.running()
             let stale = bar.staleApps(in: rows, running: running)
             let first = stale.keys.min().map { pid in "\(running.first { $0.pid == pid }?.name ?? String(pid)): \(stale[pid]!)" }
             fastHideReason = rows.fault ?? first ?? observed.issues.first?.message ?? "incomplete observation"
             return
         }
         // The bar vouches for identities, not order; the hide rule below is only
-        // safe for the order the last full pass verified.
-        guard observed.order == bar.order else { fastHideReason = "known window order changed"; return }
+        // safe for the order the last completed pass left.
+        guard observed.order == verifiedOrder else { fastHideReason = "known window order changed"; return }
         guard let config else { fastHideReason = "config missing"; return }
-        let available = Set(snapshot.icons.filter(\.movable).map(\.id))
+        let shown = present(observed)
+        if let issue = shown.aliases?.issue { fastHideReason = issue.message; return }
+        let available = Set(shown.icons.filter(\.movable).map(\.id))
         separator.length = config.hidden.contains(where: available.contains) ? 10_000 : 4
         fastHides += 1
         fastHideReason = nil
@@ -502,75 +505,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !Mover.sessionIsLocked else { throw CancellationError() }
     }
 
-    private func scan(token: Int) async throws -> InventorySnapshot {
+    /// One gather for the full pass. The bar is kept whatever it shows; the pass gets
+    /// it only when complete, under config ids.
+    private func look(token: Int, lap: (String) -> Void) async throws -> Observed {
         scans += 1
         let started = DispatchTime.now().uptimeNanoseconds
         defer { lastScanMS = elapsedMS(since: started) }
-        let raw = try await inventory.scan()
+        lap("apply")
+        let rows = try await Gather.rows(on: geometry)
         try check(token)
-        // AX follows the active bar, whereas named CG owner windows may remain on
-        // another display. Never combine geometry from two physical bars.
-        if raw.complete {
-            guard let row = raw.icons.first?.frame.minY,
-                  raw.icons.allSatisfy({ abs($0.frame.minY - row) < 2 }) else {
-                throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting for a coherent active menu bar"))
-            }
-            observationY = row
-        }
-        guard let config else { return raw }
-        var allocated = Set(config.items.keys)
-        let mapped = raw.icons.map { icon -> BarIcon in
-            let matches = config.items.filter { $0.value.bundleID == icon.metadata.bundleID && $0.value.item == icon.metadata.item }
-            let id: String
-            if matches.count == 1 { id = matches.first!.key }
-            else {
-                var candidate = icon.id; var suffix = 2
-                while allocated.contains(candidate) { candidate = icon.id + "#" + String(suffix); suffix += 1 }
-                id = candidate; allocated.insert(id)
-            }
-            return BarIcon(id: id, metadata: icon.metadata, pid: icon.pid, windowID: icon.windowID,
-                           frame: icon.frame, movable: icon.movable)
-        }
-        let groups = Dictionary(grouping: mapped, by: \.id)
-        let collisions = groups.filter { $0.value.count > 1 }.keys.sorted()
-        return InventorySnapshot(icons: mapped.filter { groups[$0.id]?.count == 1 },
-            ambiguous: raw.ambiguous + collisions.map { "Ambiguous config alias: " + $0 }, issues: raw.issues,
-            statusKeys: raw.statusKeys)
-    }
-
-    private func requireComplete(_ value: InventorySnapshot) throws {
-        guard value.complete else {
+        lap("windows")
+        let observed = try await Gather.bar(rows, previous: bar, reach: .full, reader: reader, check: { try self.check(token) })
+        bar = observed
+        lap("apps")
+        guard observed.complete else {
             // Incomplete observations are not a visibility command. In particular,
             // switching the active display must preserve the last physical state.
-            let issue = value.issues.first(where: { $0.recovery == .retry }) ?? value.issues.first
-                ?? WorkIssue(recovery: .retry, message: value.ambiguous.joined(separator: "; "))
-            throw DeferredWork(issue: issue)
+            throw DeferredWork(issue: observed.rows.fault.map { WorkIssue(recovery: .retry, message: $0) }
+                ?? observed.issues.first(where: { $0.recovery == .retry }) ?? observed.issues[0])
         }
+        let shown = present(observed)
+        if let issue = shown.aliases?.issue { throw DeferredWork(issue: issue) }
+        let targets = Set(observed.roles.map(\.pid))
+        if targets != observerTargets || (!observers.isRefreshing && observers.issues.contains(where: { $0.recovery == .retry })) {
+            observerTargets = targets
+            observers.refresh(pids: targets)
+        }
+        return shown
     }
 
-    /// Tuck's separator and control from one window-list read; nil unless both
-    /// are identified.
-    private func ownIcons() async throws -> [BarIcon]? {
-        let pid = getpid()
-        let row = observationY
-        let found: [BarIcon] = try await SerialWorker.system.run {
-            let windows = (try? WindowList.readSkippingMalformed())?.list.windows ?? []
-            let candidates = windows.filter { $0.key.pid == pid }
-            return [OwnItem.separator, .control].compactMap { own in
-                let selected: StatusWindow?
-                if let row { selected = ownedStatusWindow(title: own.title, menuY: row, candidates: candidates) }
-                else {
-                    let named = candidates.filter { $0.title == own.title }
-                    selected = named.count == 1 ? named[0] : nil
-                }
-                return selected.map {
-                    BarIcon(id: own.id, metadata: ItemMetadata(bundleID: "local.tuck", label: own.id), pid: pid,
-                            windowID: $0.key.number, frame: $0.frame, movable: true)
+    /// A bar under the current config's ids.
+    private struct Observed {
+        let bar: MenuBar
+        /// Every icon of another app that has an id and a window, left to right on the
+        /// reference row; an icon without a window there takes its frame from another row.
+        let icons: [BarIcon]
+        /// Movable icons and Tuck's own items on the reference row, left to right.
+        let managed: [BarIcon]
+        /// The reference row's minY.
+        let row: CGFloat?
+        /// nil without a config: ids are then identity keys.
+        let aliases: Aliases?
+    }
+
+    private func present(_ bar: MenuBar) -> Observed {
+        let reference = bar.referenceRow
+        let located = bar.roles.compactMap { role -> (role: Role, key: WindowKey, frame: CGRect, onReference: Bool)? in
+            for row in (reference.map { [$0] } ?? []) + Array(bar.rows.rows.indices) {
+                if role.members.indices.contains(row), let key = role.members[row], let frame = bar.frame(of: role, row: row) {
+                    return (role, key, frame, row == reference)
                 }
             }
+            return nil
         }
-        ownFrames = Dictionary(uniqueKeysWithValues: found.map { ($0.id, $0) })
-        return found.count == 2 ? found : nil
+        let aliases = config.map { Aliases(located.map(\.role.identity), items: $0.items) }
+        var icons: [BarIcon] = []
+        var managed: [BarIcon] = []
+        for (index, entry) in located.enumerated() {
+            guard let id = aliases == nil ? entry.role.identity.key : aliases!.ids[index] else { continue }
+            let role = entry.role
+            let icon = BarIcon(id: id, metadata: ItemMetadata(bundleID: role.identity.bundle, label: role.label,
+                                                              item: role.identity.item, movable: role.movable),
+                               pid: role.pid, windowID: entry.key.number, frame: entry.frame, movable: role.movable)
+            icons.append(icon)
+            if role.movable && entry.onReference { managed.append(icon) }
+        }
+        if let reference {
+            for (own, window) in [(OwnItem.separator, bar.rows.separator[reference]), (.control, bar.rows.control[reference])] {
+                managed.append(BarIcon(id: own.id, metadata: ItemMetadata(bundleID: "local.tuck", label: own.id), pid: getpid(),
+                                       windowID: window.key.number, frame: window.frame, movable: true))
+            }
+        }
+        return Observed(bar: bar, icons: icons, managed: managed.sorted { $0.frame.minX < $1.frame.minX },
+                        row: reference.map { bar.rows.rows[$0] }, aliases: aliases)
     }
 
     private func placeOwnedItem(_ item: NSStatusItem, icon: BarIcon, before anchor: BarIcon?, rightEdge: CGFloat) async throws {
@@ -591,16 +598,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func label(for id: String) -> String {
-        if id == Inventory.separatorID || id == Inventory.controlID { return "Tuck's own item" }
+        if OwnItem(rawValue: id) != nil { return "Tuck's own item" }
         return config?.items[id]?.label ?? id
-    }
-
-    /// Movable icons and Tuck's own two items, left to right.
-    private func managedIcons(_ scan: InventorySnapshot) async throws -> [BarIcon] {
-        guard let own = try await ownIcons() else {
-            throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting for menu bar windows"))
-        }
-        return (scan.icons.filter(\.movable) + own).sorted { $0.frame.minX < $1.frame.minX }
     }
 
     private func requireQuietInput() throws {
@@ -632,18 +631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             phases[name, default: 0] += Double(now - lapStart) / 1_000_000
             lapStart = now
         }
-        var fresh = try await scan(token: token)
-        lap("scan")
-        try requireComplete(fresh)
-        // The scan's own starting window list is the "before" that the final
-        // read must still match for the layout to count as verified.
-        let beforeKeys = fresh.statusKeys
-        snapshot = fresh // never publish disappearance from an incomplete scan
-        let targets = Set(fresh.icons.map(\.pid))
-        if targets != observerTargets || (!observers.isRefreshing && observers.issues.contains(where: { $0.recovery == .retry })) {
-            observerTargets = targets
-            observers.refresh(pids: targets)
-        }
+        var fresh = try await look(token: token, lap: lap)
         let discovered = Dictionary(uniqueKeysWithValues: fresh.icons.map { ($0.id, $0.metadata) })
         let orderedIDs = fresh.icons.map(\.id)
         let store = self.store
@@ -656,15 +644,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Discovery is only a writer. The normal file watch performs adoption.
             throw DeferredWork(issue: WorkIssue(recovery: .awaitChange, message: "Waiting for discovered config revision"))
         }
-        var observed = try await managedIcons(fresh)
-        try check(token)
-        lap("ownIcons")
+        var observed = fresh.managed
         let available = Set(fresh.icons.filter(\.movable).map(\.id))
         let hidden = config.hidden.filter { available.contains($0) }
         let visible = config.visible.filter { available.contains($0) }
         func analyse(_ icons: [BarIcon]) throws -> Layout {
-            try Layout(order: icons.map(\.id), hidden: hidden, visible: visible,
-                       rows: Set(NSScreen.displayBounds.map(\.minY)).sorted(), label: label(for:))
+            try Layout(order: icons.map(\.id), hidden: hidden, visible: visible, rows: fresh.bar.rows.rows, label: label(for:))
         }
         func waitForMove() -> DeferredWork {
             DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting to verify previous move"))
@@ -698,22 +683,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             separator.length = 4
             phase = "applying"; writeRuntime()
             try await Task.sleep(nanoseconds: 100_000_000)
-            fresh = try await scan(token: token); try requireComplete(fresh)
-            observed = try await managedIcons(fresh)
-            try check(token)
+            fresh = try await look(token: token, lap: lap)
+            observed = fresh.managed
             let byID = Dictionary(uniqueKeysWithValues: observed.map { ($0.id, $0) })
             layout = try analyse(observed)
             guard let move = layout.next, let icon = byID[move.id] else { break }
             if let reason = history.abandoned(move) { note = try giveUp(on: move, reason: reason); break }
             let managedRight = observed.map { $0.frame.maxX }.max() ?? 0
-            let fixed = fresh.icons.filter { !$0.movable && $0.frame.minX >= managedRight - 1 }.map { $0.frame.minX }.min()
+            let row = fresh.row ?? .nan
+            let fixed = fresh.icons.filter {
+                !$0.movable && abs($0.frame.minY - row) < 2 && $0.frame.minX >= managedRight - 1
+            }.map { $0.frame.minX }.min()
             let edge = fixed.map { $0 - 1 } ?? managedRight - 1
             let anchor = move.before.flatMap { byID[$0] }
-            if icon.id == Inventory.separatorID || icon.id == Inventory.controlID {
+            if let own = OwnItem(rawValue: icon.id) {
                 beganEffect = true
                 history = history.record(.began(move))
-                try await placeOwnedItem(icon.id == Inventory.separatorID ? separator : control,
-                    icon: icon, before: anchor, rightEdge: edge)
+                try await placeOwnedItem(own == .separator ? separator : control, icon: icon, before: anchor, rightEdge: edge)
             } else {
                 do {
                     try await mover.move(icon, before: anchor, rightEdge: edge,
@@ -732,9 +718,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             moves += 1; budget -= 1
             try check(token)
-            let after = try await scan(token: token); try requireComplete(after)
-            snapshot = after; fresh = after
-            observed = try await managedIcons(after)
+            fresh = try await look(token: token, lap: lap)
+            observed = fresh.managed
             layout = try analyse(observed)
             history = history.observe(order: layout.order, goalMet: layout.next == nil)
             if history.pending { throw waitForMove() }
@@ -747,17 +732,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting to register newly observed icons"))
         }
         separator.length = !showHidden && !hidden.isEmpty ? 10_000 : 4
-        snapshot = fresh
         if observers.isRefreshing || observers.issues.contains(where: { $0.recovery == .retry }) {
             throw DeferredWork(issue: WorkIssue(recovery: .retry, message: "Waiting for observation subscriptions"))
         }
-        if let beforeKeys, let read = try? await geometry.run({ try WindowList.readSkippingMalformed() }) {
-            try check(token)
-            bar = !read.malformed && read.list.keys == beforeKeys
-                ? Self.verifiedBar(fresh.icons, list: read.list, running: AppProcess.running(), displays: Display.current())
-                : .none
-        } else { bar = .none }
-        lap("verify")
+        verifiedOrder = fresh.bar.order
+        lap("apply")
         reconciles += 1
         reconcilePhases = phases
         lastReconcileMS = phases.values.reduce(0, +)
@@ -765,26 +744,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return note
     }
 
-    /// The scan's icons as clean readings over the list read after the pass applied.
-    /// Every running app with a status window was read by that scan, so one without
-    /// icons is read as having none.
-    private static func verifiedBar(_ icons: [BarIcon], list: WindowList, running: [AppProcess],
-                                    displays: [Display]) -> MenuBar {
-        let byPID = Dictionary(grouping: icons, by: \.pid)
-        let present = Set(list.windows.map(\.key.pid))
-        let readings = running.filter { byPID[$0.pid] != nil || present.contains($0.pid) }.map { app in
-            AppReading(app: app, outcome: .clean((byPID[app.pid] ?? []).enumerated().map { index, icon in
-                AppReading.BoundIcon(identity: IconIdentity(bundle: icon.metadata.bundleID, item: icon.metadata.item),
-                                     label: icon.metadata.label, movable: icon.movable,
-                                     window: WindowKey(pid: icon.pid, number: icon.windowID), element: index)
-            }))
-        }
-        return MenuBar.observe(MenuRows(list, ownPID: getpid(), displays: displays), running: running,
-                               readings: readings, previous: .none)
-    }
-
     private func issue(for error: Error) -> WorkIssue {
         if let deferred = error as? DeferredWork { return deferred.issue }
+        if let read = error as? AXReadFailure { return read.issue }
         if let movement = error as? MovementFailure { return WorkIssue(recovery: movement.recovery, message: movement.message) }
         if let store = error as? ConfigStoreError {
             switch store {
@@ -804,13 +766,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func writeRuntime() {
+        let shown = present(bar)
+        let reference = bar.referenceRow
         let data: [String: Any] = ["accessibility": accessibility, "sessionLocked": Mover.sessionIsLocked,
             "menuOpen": observers.isMenuOpen, "menuCount": observers.menuCount, "menuPIDs": observers.menuPIDs,
             "inputBusy": mover.userIsBusy, "menuChecks": observers.menuChecks,
             "menuCheckResult": observers.lastMenuCheckResult as Any? ?? NSNull(),
             "menuCheckReason": observers.lastMenuCheckReason as Any? ?? NSNull(),
             "showHidden": showHidden, "config": configURL.path, "scans": scans, "moves": moves,
-            "configLoads": configLoads, "ambiguous": snapshot.ambiguous, "pid": getpid(),
+            "configLoads": configLoads, "ambiguous": (shown.aliases?.collisions ?? []).map { "Ambiguous config alias: " + $0 },
+            "pid": getpid(),
             "clickTraces": clickTraces.map { trace in
                 ["id": trace.id, "mouseUpNS": trace.mouseUpNS, "acceptedNS": trace.acceptedNS,
                  "committedNS": trace.committedNS as Any? ?? NSNull(),
@@ -821,15 +786,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "visibilityCheckMS": lastVisibilityCheckMS, "fastHides": fastHides,
             "fastHideReason": fastHideReason as Any? ?? NSNull(),
             "verifiedLayout": bar.reusable,
-            "icons": snapshot.icons.map { ["id": $0.id, "label": $0.metadata.label, "movable": $0.movable, "x": $0.frame.minX] as [String: Any] },
+            "icons": shown.icons.map { ["id": $0.id, "label": $0.metadata.label, "movable": $0.movable, "x": $0.frame.minX] as [String: Any] },
             "hiddenIDs": config?.hidden ?? [], "revision": desiredRevision,
             "appliedRevision": appliedRevision as Any? ?? NSNull(), "workGeneration": gate.generation,
             "appliedGeneration": gate.applied as Any? ?? NSNull(), "phase": phase,
             "pending": gate.pending || gate.running != nil || needsConfig || toggleWork != nil,
             "applying": phase == "applying", "error": lastError as Any? ?? NSNull(),
             "waiting": waiting as Any? ?? NSNull(), "retryDelay": retryDelay as Any? ?? NSNull(), "retries": retries,
-            "controlX": ownFrames[Inventory.controlID]?.frame.minX ?? -1,
-            "separatorX": ownFrames[Inventory.separatorID]?.frame.minX ?? -1,
+            "controlX": reference.map { bar.rows.control[$0].frame.minX } ?? -1,
+            "separatorX": reference.map { bar.rows.separator[$0].frame.minX } ?? -1,
             "separatorWidth": separator?.length ?? -1]
         guard let bytes = try? JSONSerialization.data(withJSONObject: data, options: [.prettyPrinted, .sortedKeys]), bytes != lastRuntime else { return }
         lastRuntime = bytes; pendingRuntime = bytes

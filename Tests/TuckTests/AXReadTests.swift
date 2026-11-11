@@ -120,14 +120,33 @@ final class AXReadTests: XCTestCase {
     }
 
     func testIncompleteSnapshotsNeverAuthorizeCachedIdentityAsComplete() {
-        XCTAssertTrue(InventorySnapshot(icons: [], ambiguous: []).complete)
-        XCTAssertFalse(InventorySnapshot(icons: [], ambiguous: ["Unknown identity"]).complete)
-        let cached = BarIcon(id: "cached", metadata: ItemMetadata(bundleID: "local.test", label: "Cached"),
-            pid: 12345, windowID: 42, frame: .zero, movable: true)
-        let snapshot = InventorySnapshot(icons: [cached], ambiguous: [],
-            issues: [WorkIssue(recovery: .retry, message: "Target busy")])
-        XCTAssertEqual(snapshot.icons.map(\.id), ["cached"])
-        XCTAssertFalse(snapshot.complete)
+        let own: Int32 = 900
+        let app = AppProcess(pid: 12345, bundle: "local.test", name: "Test", incarnation: "1")
+        let icon = StatusWindow(key: WindowKey(pid: app.pid, number: 42), frame: CGRect(x: 100, y: 0, width: 30, height: 24), onScreen: true)
+        let list = WindowList(skippingMalformed: [
+            icon,
+            StatusWindow(key: WindowKey(pid: own, number: 1), frame: CGRect(x: 200, y: 0, width: 4, height: 24),
+                         onScreen: true, title: OwnItem.separator.title),
+            StatusWindow(key: WindowKey(pid: own, number: 2), frame: CGRect(x: 220, y: 0, width: 20, height: 24),
+                         onScreen: true, title: OwnItem.control.title)])
+        let rows = MenuRows(list, ownPID: own, displays: [])
+        let cached = AppReading.BoundIcon(identity: IconIdentity(bundle: app.bundle, item: "cached"), label: "Cached",
+                                          movable: true, window: icon.key, element: 0)
+        let clean = MenuBar.observe(rows, running: [app], readings: [AppReading(app: app, outcome: .clean([cached]))], previous: .none)
+        XCTAssertTrue(clean.complete)
+        XCTAssertTrue(clean.reusable)
+
+        let busy = MenuBar.observe(rows, running: [app], readings: [.failed(app, WorkIssue(recovery: .retry, message: "Target busy"))],
+                                   previous: clean)
+        XCTAssertEqual(busy.roles.map(\.identity.key), ["local.test::cached"])
+        XCTAssertFalse(busy.complete)
+        XCTAssertFalse(busy.reusable)
+        XCTAssertEqual(busy.staleApps(in: rows, running: [app]), [app.pid: "previous read incomplete"])
+
+        let unread = MenuBar.observe(rows, running: [app], readings: [], previous: busy)
+        XCTAssertEqual(unread.roles.map(\.identity.key), ["local.test::cached"])
+        XCTAssertFalse(unread.complete)
+        XCTAssertEqual(unread.issues, [WorkIssue(recovery: .retry, message: "Test: not read (previous read incomplete)")])
     }
 
     @MainActor

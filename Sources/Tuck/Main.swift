@@ -39,14 +39,22 @@ struct TuckMain {
             let app = NSApplication.shared
             Task { @MainActor in
                 do {
-                    let snapshot = try await Inventory().scan()
-                    let data: [String: Any] = ["accessibility": AXIsProcessTrusted(), "complete": snapshot.complete,
-                        "ambiguous": snapshot.ambiguous, "issues": snapshot.issues.map { ["recovery": $0.recovery.rawValue, "message": $0.message] },
-                        "icons": snapshot.icons.map { icon in
-                            ["id": icon.id, "bundleID": icon.metadata.bundleID, "label": icon.metadata.label,
-                             "item": icon.metadata.item as Any? ?? NSNull(), "movable": icon.movable,
-                             "windowID": icon.windowID, "x": icon.frame.minX, "width": icon.frame.width] as [String: Any]
-                        }]
+                    let rows = try await Gather.rows(on: SerialWorker(label: "local.tuck.inventory"),
+                                                     adding: standInAnchors(Display.current()))
+                    let bar = try await Gather.bar(rows, previous: .none, reach: .full, reader: AppReader())
+                    let issues = bar.rows.fault.map { [WorkIssue(recovery: .retry, message: $0)] } ?? bar.issues
+                    let counts = Dictionary(bar.roles.map { ($0.identity, 1) }, uniquingKeysWith: +)
+                    let icons = bar.roles.filter { counts[$0.identity] == 1 }.compactMap { role -> [String: Any]? in
+                        let rows = (bar.referenceRow.map { [$0] } ?? []) + Array(bar.rows.rows.indices)
+                        guard let row = rows.first(where: { bar.frame(of: role, row: $0) != nil }),
+                              let key = role.members[row], let frame = bar.frame(of: role, row: row) else { return nil }
+                        return ["id": role.identity.key, "bundleID": role.identity.bundle, "label": role.label,
+                                "item": role.identity.item as Any? ?? NSNull(), "movable": role.movable,
+                                "windowID": key.number, "x": frame.minX, "width": frame.width]
+                    }
+                    let data: [String: Any] = ["accessibility": AXIsProcessTrusted(), "complete": bar.complete,
+                        "ambiguous": issues.map(\.message), "issues": issues.map { ["recovery": $0.recovery.rawValue, "message": $0.message] },
+                        "icons": icons]
                     let json = try JSONSerialization.data(withJSONObject: data, options: [.prettyPrinted, .sortedKeys])
                     FileHandle.standardOutput.write(json); print(""); exit(0)
                 } catch { fputs("\(error)\n", stderr); exit(1) }
@@ -58,5 +66,21 @@ struct TuckMain {
         let delegate = AppDelegate(configURL: configURL)
         app.delegate = delegate
         app.run()
+    }
+
+    /// `--inventory` has no status items of its own, and rows are anchored by Tuck's
+    /// control. It stands in a control and separator just past the right edge of each
+    /// display's menu row, where they cover no icon.
+    static func standInAnchors(_ displays: [Display]) -> [StatusWindow] {
+        let edges = Dictionary(displays.map { ($0.frame.minY, $0.frame.maxX) }, uniquingKeysWith: max).sorted { $0.key < $1.key }
+        return edges.enumerated().flatMap { index, edge -> [StatusWindow] in
+            let number = UInt32(index * 2 + 1)
+            return [StatusWindow(key: WindowKey(pid: getpid(), number: number),
+                                 frame: CGRect(x: edge.value, y: edge.key, width: 20, height: 24), onScreen: true,
+                                 title: index == 0 ? OwnItem.control.title : ""),
+                    StatusWindow(key: WindowKey(pid: getpid(), number: number + 1),
+                                 frame: CGRect(x: edge.value + 20, y: edge.key, width: 4, height: 24), onScreen: true,
+                                 title: index == 0 ? OwnItem.separator.title : "")]
+        }
     }
 }

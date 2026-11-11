@@ -252,8 +252,11 @@ final class MenuBarReplicaTests: XCTestCase {
         assertCertified(bar, original)
         XCTAssertEqual(stale(bar, projected), [77: "status-window membership changed"])
         XCTAssertEqual(stale(bar, original + [window(98, x: 400)]), [42: "status-window membership changed"])
-        // A running app's window that appeared after the apps were read.
-        XCTAssertEqual(stale(certify(projected), original), [77: "not yet read"])
+        // A running app's window that appeared after the apps were read is read once it
+        // can be an icon; a panel alone gives it nothing to read.
+        XCTAssertEqual(stale(certify(projected), original), [:])
+        XCTAssertEqual(stale(certify(projected), projected + [window(98, x: 50, pid: 77)]), [77: "not yet read"])
+        XCTAssertEqual(stale(certify(projected), projected + [window(98, x: 50, y: -1080, pid: 77)]), [:])
         // Accepted tradeoff: a ghost whose process is not a running app is not evidence.
         let running = apps.filter { $0.pid != 77 }
         XCTAssertNil(decline(certify(original, running: running), projected, running: running))
@@ -601,6 +604,73 @@ final class MenuBarReplicaTests: XCTestCase {
         let clean = MenuBar.observe(rows(projected), running: apps,
                                     readings: readings(icons(known), in: projected, running: apps), previous: unclear)
         XCTAssertTrue(clean.reusable)
+    }
+
+    // MARK: - What a pass reads
+
+    private var twoApps: (sources: [StatusWindow], all: [StatusWindow]) {
+        let sources = known + [window(3, x: 140, pid: 43, onScreen: true)]
+        return (sources, sources + replicas(sources))
+    }
+
+    func testANoChangeObservationNamesNoStaleApp() {
+        let fixture = twoApps
+        let bar = certify(fixture.all, evidence: icons(fixture.sources))
+        assertCertified(bar, fixture.all)
+        XCTAssertEqual(stale(bar, fixture.all), [:])
+        // Hiding moves every hidden icon; frames are not evidence.
+        let hidden = fixture.all.map { item -> StatusWindow in
+            guard item.key.pid != ownPID else { return item }
+            return window(item.key.number, x: item.frame.minX - 10_000, y: item.frame.minY, pid: item.key.pid)
+        }
+        XCTAssertEqual(stale(bar, hidden), [:])
+        let next = MenuBar.observe(rows(hidden), running: apps, readings: [], previous: bar)
+        XCTAssertTrue(next.complete)
+        XCTAssertTrue(next.reusable)
+        XCTAssertEqual(next.order, bar.order)
+    }
+
+    func testAfterOneAppsWindowsChangeOnlyThatAppIsStale() {
+        let fixture = twoApps
+        let bar = certify(fixture.all, evidence: icons(fixture.sources))
+        let changed = fixture.all + [window(4, x: 60, pid: 43, onScreen: true)]
+        XCTAssertEqual(stale(bar, changed), [43: "status-window membership changed"])
+        // Reading that one app makes the bar whole again.
+        let reading = AppReading(app: app(43), outcome: .clean([
+            AppReading.BoundIcon(identity: IconIdentity(bundle: "app43", item: "3"), label: "App 43", movable: true,
+                                 window: WindowKey(pid: 43, number: 3), element: 0),
+            AppReading.BoundIcon(identity: IconIdentity(bundle: "app43", item: "4"), label: "App 43", movable: false,
+                                 window: WindowKey(pid: 43, number: 4), element: 1)]))
+        let next = MenuBar.observe(rows(changed), running: apps, readings: [reading], previous: bar)
+        XCTAssertTrue(next.complete, "\(next.issues)")
+        XCTAssertEqual(Set(next.roles.map(\.identity.key)), [id(42, 1), id(42, 2), id(43, 3), id(43, 4)])
+        XCTAssertTrue(next.reusable)
+        XCTAssertEqual(next.staleApps(in: rows(changed), running: apps), [:])
+    }
+
+    func testRowsThatDisagreeOnOrderBlockOnlyAnAppNotReadThisPass() {
+        let bar = certify(projected)
+        // CPU's replica jumps past Tuck's control on the other row.
+        let disagreeing = replacing(projected, WindowKey(pid: 42, number: 101), with: window(101, x: -100, y: -1440))
+        XCTAssertEqual(stale(bar, disagreeing), [42: "known window order changed"])
+        let unread = MenuBar.observe(rows(disagreeing), running: apps, readings: [], previous: bar)
+        XCTAssertFalse(unread.complete)
+        XCTAssertTrue(unread.issues.contains(WorkIssue(recovery: .retry, message: "known window order changed")))
+        // Read on the active row this pass, the app's order there is fresh: the pass
+        // proceeds on it, and the bar is not reused.
+        let read = MenuBar.observe(rows(disagreeing), running: apps,
+                                   readings: readings(icons(known), in: disagreeing, running: apps), previous: bar)
+        XCTAssertTrue(read.complete, "\(read.issues)")
+        XCTAssertFalse(read.reusable)
+        XCTAssertEqual(read.order, [id(42, 1), id(42, 2), OwnItem.separator.id, OwnItem.control.id])
+        XCTAssertNotNil(read.staleApps(in: rows(disagreeing), running: apps)[42])
+    }
+
+    func testABarWithNoIconsOfOtherAppsIsNotComplete() {
+        let empty = MenuBar.observe(rows(projected), running: apps,
+                                    readings: [AppReading(app: app(42), outcome: .clean([]))], previous: .none)
+        XCTAssertFalse(empty.complete)
+        XCTAssertEqual(empty.issues, [WorkIssue(recovery: .retry, message: "Waiting for a coherent active menu bar")])
     }
 
     func testAppThatQuitIsDropped() {
