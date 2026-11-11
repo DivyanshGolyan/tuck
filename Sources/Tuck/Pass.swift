@@ -1,5 +1,6 @@
 import AppKit
 import TuckCore
+import os
 
 /// A pass that did not apply, with what the scheduler should do about it.
 struct DeferredWork: Error { let issue: WorkIssue }
@@ -269,37 +270,36 @@ final class Reconciler {
     }
 }
 
-/// Running apps with a bundle id, excluding Tuck. NSWorkspace keeps one
-/// NSRunningApplication per process, and a process keeps its pid, bundle and
-/// incarnation for life, so each instance is read once and forgotten when it leaves the
-/// list. Holding the instance keeps its identifier from being reused meanwhile. A
-/// process with no knowable incarnation gets a new one on every read, as it always has.
+/// Running apps with a bundle id, excluding Tuck. Asking NSWorkspace for the list
+/// costs over 10 ms on the main thread, so the answer is kept until the list changes.
+/// A pid can only be reused after its process left the list, so a process with no
+/// knowable incarnation keeps one made-up incarnation until then and gets a new one
+/// on the next read.
 @MainActor
 final class RunningApps {
-    private enum Entry { case excluded, process(AppProcess) }
-    private var known: [ObjectIdentifier: (instance: NSRunningApplication, entry: Entry)] = [:]
+    private let changed = OSAllocatedUnfairLock(initialState: true)
+    private var observation: NSKeyValueObservation?
+    private var processes: [AppProcess] = []
+
+    init() {
+        observation = NSWorkspace.shared.observe(\.runningApplications) { [changed] _, _ in
+            changed.withLock { $0 = true }
+        }
+    }
 
     func current() -> [AppProcess] {
-        let own = getpid()
-        var next: [ObjectIdentifier: (instance: NSRunningApplication, entry: Entry)] = [:]
-        let processes = NSWorkspace.shared.runningApplications.compactMap { instance -> AppProcess? in
-            let id = ObjectIdentifier(instance)
-            if let entry = known[id]?.entry {
-                next[id] = (instance, entry)
-                if case .process(let process) = entry { return process }
-                return nil
-            }
-            guard instance.processIdentifier != own, let bundle = instance.bundleIdentifier, bundle != "local.tuck" else {
-                next[id] = (instance, .excluded)
-                return nil
-            }
-            let incarnation = AppProcess.incarnation(pid: instance.processIdentifier, launchDate: instance.launchDate)
-            let process = AppProcess(pid: instance.processIdentifier, bundle: bundle, name: instance.localizedName ?? bundle,
-                                     incarnation: incarnation ?? UUID().uuidString)
-            if incarnation != nil { next[id] = (instance, .process(process)) }
-            return process
+        let stale = changed.withLock { flag -> Bool in
+            defer { flag = false }
+            return flag
         }
-        known = next
+        guard stale else { return processes }
+        let own = getpid()
+        processes = NSWorkspace.shared.runningApplications.compactMap { instance in
+            guard instance.processIdentifier != own, let bundle = instance.bundleIdentifier, bundle != "local.tuck" else { return nil }
+            let incarnation = AppProcess.incarnation(pid: instance.processIdentifier, launchDate: instance.launchDate)
+            return AppProcess(pid: instance.processIdentifier, bundle: bundle, name: instance.localizedName ?? bundle,
+                              incarnation: incarnation ?? UUID().uuidString)
+        }
         return processes
     }
 }
@@ -327,6 +327,8 @@ enum Gather {
         case full
     }
 
+    private static let debug = ProcessInfo.processInfo.environment["TUCK_DEBUG_INVENTORY"] == "1"
+
     /// The one full window-list read. Malformed records are dropped and `skippedMalformed` says so.
     static func rows(on worker: SerialWorker, adding extra: [StatusWindow] = []) async throws -> MenuRows {
         let displays = Display.current()
@@ -346,6 +348,10 @@ enum Gather {
         // Faulty rows can bind nothing; the bar is incomplete either way.
         if reach == .full && rows.fault == nil && !survey.stale.isEmpty {
             let targets = running.filter { survey.stale[$0.pid] != nil }
+            if debug {
+                let reasons = targets.map { "\($0.name): \(survey.stale[$0.pid] ?? "")" }.joined(separator: "; ")
+                fputs("AX read [\(reasons)]\n", stderr)
+            }
             let hadIcons = Set(previous.roles.map(\.pid))
             readings = try await SerialWorker.system.run { reader.read(targets, rows: rows, hadIcons: hadIcons) }
             try check()
