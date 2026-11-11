@@ -1,7 +1,7 @@
 # How Tuck stays responsive under load
 
-Tuck depends on other apps. Each scan asks every menu bar app for its icons
-through Accessibility, and any of those apps can be slow or stuck. This page
+Tuck depends on other apps. It asks menu bar apps for their icons through
+Accessibility, and any of those apps can be slow or stuck. This page
 explains how Tuck keeps the chevron responsive when that happens.
 
 The aim is modest. Slow convergence is acceptable. A frozen chevron, a growing
@@ -23,26 +23,49 @@ value, the same way it applies an edit from an editor.
 - Accessibility and window-list reads run on one serial worker. Config reads
   and writes run on a second serial worker. The main actor never blocks on
   either.
-- Config adoption does not wait for a scan. A reveal needs only Tuck's own
+- Config adoption does not wait for a pass. A reveal needs only Tuck's own
   separator, so a stuck app cannot delay it.
 - One pass runs at a time. New events do not queue. They mark the latest
   request as pending, and an old pass cannot mark a newer request as applied.
 
-## How a scan stays bounded
+## How a pass works
 
-- Each Accessibility read has a 0.35 second timeout. Each app and each scan
+A pass repeats three steps until nothing is left to do.
+
+1. Read the window list once. The window list is the set of on-screen windows
+   that macOS reports, and every menu bar icon is one of them. The read needs
+   no answer from any other app.
+2. Update the menu bar model. The model remembers which icon each window is.
+   It keeps that identity between passes, and takes every position from the
+   new window list. An app is read through Accessibility only when the model
+   cannot vouch for it: the app is new, it restarted, or its windows changed.
+3. Decide. One pure function, `assess`, takes the config, the model, and the
+   history of earlier moves. It returns what the separator must do and the
+   next action, which is to stop, to add new icons to the config, or to make
+   one move.
+
+When nothing changed, a pass is one window-list read and no Accessibility
+call. A hide that changes only `showHidden` is the same pass, limited to what
+it can do without reading an app. There is no separate fast path.
+
+`assess` plans the moves that put each icon on the correct side of the
+separator before the moves that only fix the order. An icon that you hid is
+never left visible because an unrelated icon would not move.
+
+## How a pass stays bounded
+
+- Each Accessibility read has a 0.35 second timeout. Each app and each pass
   also have a read budget. The budget is checked between reads, because Tuck
   cannot interrupt a read that has started.
-- When an app does not answer, Tuck keeps the last icons that it read from that
-  app and marks the scan incomplete. An incomplete scan never hides or reveals
-  anything.
-- A scan asks an app for icon geometry only when the app's status windows
-  changed since its last clean read. One remembered app is read again on every
-  scan, in rotation, to notice a switch of the active display. Tuck forgets
-  every remembered app when the icons report more than one menu bar row.
+- When an app that must be read does not answer, the model is incomplete. An
+  incomplete model never hides or reveals anything.
+- A pass makes a limited number of moves. The limit is twice the number of
+  managed icons, and at least four.
+- After each full pass, Tuck reads one remembered app again in the background,
+  in rotation. If the app disagrees with the model, Tuck drops what it
+  remembered and runs another pass. `auditMismatches` counts these.
 - Some apps, such as Control Centre, have no launch date. Tuck identifies such
-  an app by its kernel start time, so the remembered icons survive a scan and
-  a reused process ID is still detected.
+  an app by its kernel start time, so a reused process ID is still detected.
 
 ## What Tuck does after a failure
 
@@ -64,27 +87,20 @@ nothing.
 Tuck never repeats a drag because a read timed out. A drag whose result is
 unknown is checked first.
 
-## The fast hide
-
-A hide that changes only `showHidden` skips the scan. Tuck reads the window
-list once and compares it with the last layout that a full pass verified. If
-the windows and their order match, Tuck hides at once. If anything differs,
-Tuck runs a full pass.
-
 ## Measurements
 
 All numbers come from one Mac with ten cores, macOS 15.8.2, and about 23 icons.
 The Mac was busy during every run, with load averages between 7 and 120.
 Compared builds were run in alternation.
 
-| Path | Before | After | Samples | Evidence |
+| Path | First build | Now | Samples | Evidence |
 | --- | --- | --- | --- | --- |
-| Hide by click, fast path | 239 ms | 36 ms | 5 each | `scripts/benchmark-visibility.py` |
-| Full pass, nothing changed | 204 ms | 39 ms | 36 each | `scripts/bench-reconcile.py` |
+| Full pass, nothing changed | 289 ms | 7.5 ms | 30 each | `scripts/bench-reconcile.py` |
 
-Both rows are medians. The full-pass row measures the case that the remembered
-icons help most. A pass after icons move reads the moved apps again and is
-slower.
+The row holds medians. It measures the case that the model helps most. A pass
+after icons move reads the moved apps again and takes about 150 ms. A hide by
+click took 239 ms in the first build. It has not been measured again with
+`scripts/benchmark-visibility.py` since the model replaced the fast path.
 
 These measurements do not cover every third-party app or display arrangement.
 

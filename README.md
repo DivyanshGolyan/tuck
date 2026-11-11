@@ -101,7 +101,13 @@ one, run it from a terminal that has Accessibility, and keep the pointer still.
 - `revision` and `appliedRevision`: the config revision that you asked for and
   the revision that Tuck applied. They are equal when Tuck is done.
 - `icons`: each icon that Tuck found, with its position.
-- `reconcileMS` and `scanMS`: the time of the last full pass and of its scan.
+- `reconcileMS`: the time of the last full pass. `reconcilePhases` splits it
+  into `windows` (the window-list read), `apps` (Accessibility reads),
+  `register` (config writes), and `apply` (moves and the separator).
+- `verifiedLayout`: `true` when Tuck can trust its picture of the menu bar
+  without asking any app again.
+- `auditMismatches`: how often a background check found that picture wrong.
+  It should stay at 0.
 
 If System Settings shows Accessibility as enabled but `accessibility` is
 `false`, run `tccutil reset Accessibility local.tuck` and approve Tuck again.
@@ -134,10 +140,12 @@ The command affects only Tuck. Do not reset every app.
 | File | Role |
 | --- | --- |
 | `TuckCore/Configuration`, `ConfigStore`, `ConfigWatcher` | The config model, atomic reads and writes, and the file watcher |
-| `TuckCore/LayoutPlanner` | The fewest moves that reach the configured order |
-| `TuckCore/LatestWork`, `Recovery`, `MoveVerification` | Scheduling, retry, and move-verification policy |
-| `Tuck/Inventory` | Icon identities and positions from Accessibility and the window list |
+| `TuckCore/MenuRows` | The window list as menu bar rows, one per display |
+| `TuckCore/MenuBar` | Which icon each window is, and which apps must be read again |
+| `TuckCore/Verdict` | `assess`, the pure function that decides each pass, and the move history |
+| `TuckCore/LatestWork`, `Recovery` | Scheduling and retry policy |
+| `Tuck/Pass` | One pass: read, assess, act, repeat |
+| `Tuck/AppReader`, `AXRead` | Accessibility reads with timeouts and budgets |
 | `Tuck/Mover` | The Command-drag |
-| `Tuck/VisibilityLayout` | The check that allows a hide without a full scan |
 | `Tuck/Observers`, `MenuRecovery` | Accessibility notifications and open-menu tracking |
-| `Tuck/App` | Config adoption, reconciliation, and event wiring |
+| `Tuck/App` | Config adoption, scheduling, and event wiring |
